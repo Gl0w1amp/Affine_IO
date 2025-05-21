@@ -3328,7 +3328,7 @@ static void set_rts(HANDLE h, bool hi)
 /* ----- 进入/退出启动加载程序 ----- */
 static void enter_boot(HANDLE h)
 {
-    set_dtr(h, true); /* BOOT0 = 1 */
+    set_dtr(h, false); /* BOOT0 = 1 */
     set_rts(h, true); /* nRST = 0 */
     Sleep(50);
     set_rts(h, false); /* 释放复位 */
@@ -3337,7 +3337,7 @@ static void enter_boot(HANDLE h)
 
 static void exit_boot(HANDLE h)
 {
-    set_dtr(h, false); /* BOOT0 = 0 */
+    set_dtr(h, true); /* BOOT0 = 0 */
     set_rts(h, true);  /* nRST = 0 */
     Sleep(50);
     set_rts(h, false); /* nRST = 1 */
@@ -3613,7 +3613,7 @@ static bool open_boot_port(const char *name)
     dcb.ByteSize = 8;
     dcb.StopBits = ONESTOPBIT;
     dcb.fParity = TRUE;
-    dcb.fDtrControl = DTR_CONTROL_DISABLE;
+    dcb.fDtrControl = DTR_CONTROL_ENABLE;
     dcb.fRtsControl = RTS_CONTROL_DISABLE;
     dcb.fOutxCtsFlow = dcb.fOutxDsrFlow = dcb.fOutX = dcb.fInX = FALSE;
     if (!SetCommState(hBootPort, &dcb))
