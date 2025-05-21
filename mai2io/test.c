@@ -9,12 +9,64 @@
 #include <stdbool.h>
 #include <conio.h>
 #include <wchar.h>
-#include "serial.h"
-#include "dprintf.h"
 #include <setupapi.h>
 #include <devguid.h>
 
-// 外部变量
+/* ---------- 项目头文件 ---------- */
+#include "serial.h"
+#include "dprintf.h"
+
+/* ---------- 调试设置 ---------- */
+// #define DEBUG
+
+/* ---------- 常量定义 ---------- */
+// 版本号
+const char *VERSION = "v0.6.2";
+
+// 触摸和按键相关常量
+#define TOUCH_REGIONS 34        // 触摸区域总数
+#define BUTTONS_COUNT 8         // 按钮总数
+#define THRESHOLD_DEFAULT 16384 // 默认阈值
+
+// 连接和重连常量
+#define INIT_CONNECT_ATTEMPTS 5
+#define RECONNECT_INTERVAL 500
+
+// 控制台颜色定义
+#define COLOR_RED (FOREGROUND_RED | FOREGROUND_INTENSITY)
+#define COLOR_GREEN (FOREGROUND_GREEN | FOREGROUND_INTENSITY)
+#define COLOR_BLUE (FOREGROUND_BLUE | FOREGROUND_INTENSITY)
+#define COLOR_DEFAULT (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
+
+// 固件更新相关常量
+#define VID_CH340 0x1A86
+#define PID_CH340 0x7523
+#define BAUDRATE_BOOT 115200
+#define PAGE_SZ 256
+#define ERASE_RETRY 3
+#define SYNC_TIMEOUT_MS 2000
+
+/* ---------- 类型定义 ---------- */
+// 设备状态枚举
+typedef enum {
+    DEVICE_WAIT,
+    DEVICE_FAIL,
+    DEVICE_OK
+} DeviceState;
+
+// 窗口类型枚举
+typedef enum {
+    WINDOW_MAIN,
+    WINDOW_TOUCHPANEL,
+    WINDOW_FIRMWARE_UPDATE
+} WindowType;
+
+// 连接参数结构体
+typedef struct {
+    bool isPlayer1;
+} DeviceConnectParams;
+
+/* ---------- 外部变量声明 ---------- */
 extern char comPort1[13];
 extern char comPort2[13];
 extern HANDLE hPort1;
@@ -24,82 +76,48 @@ extern serial_packet_t response2;
 extern void package_init(serial_packet_t *response);
 extern void serial_writeresp(HANDLE hPortx, serial_packet_t *response);
 
-// 调试开关
-// #define DEBUG
-
-// 常量定义
-#define TOUCH_REGIONS 34        // 触摸区域总数
-#define BUTTONS_COUNT 8         // 按钮总数
-#define THRESHOLD_DEFAULT 16384 // 默认阈值
-#define INIT_CONNECT_ATTEMPTS 5
-#define RECONNECT_INTERVAL 500
-
-// 版本号定义
-const char *VERSION = "v0.6";
-
-// 颜色定义
-#define COLOR_RED (FOREGROUND_RED | FOREGROUND_INTENSITY)
-#define COLOR_GREEN (FOREGROUND_GREEN | FOREGROUND_INTENSITY)
-#define COLOR_BLUE (FOREGROUND_BLUE | FOREGROUND_INTENSITY)
-#define COLOR_DEFAULT (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
-
-// 设备状态枚举
-typedef enum
-{
-    DEVICE_WAIT,
-    DEVICE_FAIL,
-    DEVICE_OK
-} DeviceState;
-
-// 窗口类型枚举
-typedef enum
-{
-    WINDOW_MAIN,
-    WINDOW_TOUCHPANEL,
-    WINDOW_FIRMWARE_UPDATE
-} WindowType;
-
-typedef struct
-{
-    bool isPlayer1;
-} DeviceConnectParams;
-
-// 全局变量
+/* ---------- 全局变量 ---------- */
+// 窗口和UI相关
 WindowType currentWindow = WINDOW_MAIN;
-DeviceState deviceState1p = DEVICE_WAIT;
-DeviceState deviceState2p = DEVICE_WAIT;
-bool isFirstConnection1p = TRUE;
-bool isFirstConnection2p = TRUE;
-bool ledButtonsTest = FALSE;
-bool ledControllerTest = FALSE;
-// bool showRawData = FALSE;
-bool remapTouchSheet = FALSE;
-bool usePlayer2 = FALSE; // 控制是否切换到2P模式
 HANDLE hConsole;
 int consoleWidth = 100;
 int consoleHeight = 36;
 bool running = true;
+bool firmwareWindowDrawn = false;
+
+// 设备状态变量
+DeviceState deviceState1p = DEVICE_WAIT;
+DeviceState deviceState2p = DEVICE_WAIT;
+DeviceState deviceStateKobato = DEVICE_WAIT;
+bool isFirstConnection1p = TRUE;
+bool isFirstConnection2p = TRUE;
+bool usePlayer2 = FALSE; // 控制是否切换到2P模式
+
+// 设备连接配置
 char *Vid = "VID_AFF1";
 char *Pid_1p = "PID_52A5";
 char *Pid_2p = "PID_52A6";
-
-// Kobato设备VID/PID
 char *Vid_Kobato = "VID_0483";
 char *Pid_Kobato = "PID_5740";
-
-DeviceState deviceStateKobato = DEVICE_WAIT;
 HANDLE hPortKobato = INVALID_HANDLE_VALUE;
 char comPortKobato[13] = {0};
+
+// Kobato设备特性配置
 bool kobatoHighBaud = FALSE;
 bool kobatoLedEnabled = FALSE;
 uint8_t kobatoLedBrightness = 0;
 bool kobatoExtendEnabled = FALSE;
 bool kobatoReflectEnabled = FALSE;
 
+// 测试和功能标志
+bool ledButtonsTest = FALSE;
+bool ledControllerTest = FALSE;
+// bool showRawData = FALSE;
+bool remapTouchSheet = FALSE;
+
 // 多按键检测相关变量
-// 光眼无法物理检测是否连接，只能程序测试
 DWORD buttonPressStartTime = 0; // 按键同时按下的起始时间
-bool buttonFailMode = false;    // 标记按键是否进入FAIL模式
+bool buttonFailMode = false;    // 标记按键是否进入FAIL
 int previousButtonCount = 0;    // 之前按下的按键数量
 
 // 玩家输入状态
@@ -114,78 +132,24 @@ uint8_t prev_player1Buttons = 0;
 uint8_t prev_player2Buttons = 0;
 uint8_t prev_opButtons = 0;
 
+// 延迟设置相关
 uint8_t touchLatency = 0;
 uint8_t buttonLatency = 0;
 bool latencyRead = false;
 
-// 原始值数组
-// 这个现在没用
+// 触摸和阈值数据
+// 原始值现在没用
 uint8_t p1RawValue[34] = {0};
 uint8_t p2RawValue[34] = {0};
-
 uint8_t touchSheet[TOUCH_REGIONS] = {0};
-
-uint16_t ReadThreshold(HANDLE hPort, serial_packet_t *response, int index);
+uint16_t touchThreshold[TOUCH_REGIONS] = {0};
 
 // LED状态
 uint8_t buttonLEDs[24] = {0};
 uint8_t fetLEDs[3] = {0};
 
-// 阈值数据
-uint16_t touchThreshold[TOUCH_REGIONS] = {0};
-
 // 缓冲区状态
 bool dataChanged = true;
-
-// 函数声明
-void DisplayHeader(DeviceState state1p, DeviceState state2p);
-void DisplayMainWindow();
-void DisplayTouchPanelWindow();
-void SwitchWindow();
-void SwitchPlayer();
-void HandleKeyInput();
-void UpdateDeviceState();
-void ReconnectDevices();
-void UpdateButtonLEDs();
-void UpdateTouchData();
-void UpdateMultiButtonState();
-void SetCursorPosition(int x, int y);
-void ProcessTouchStateBytes(uint8_t state[7], bool touchMatrix[8][8]);
-void DisplayThresholds();
-void DisplayButtons();
-void ModifyThreshold();
-void InitThresholds();
-bool SendThreshold(HANDLE hPort, serial_packet_t *response, int index);
-// void SendThresholds(HANDLE hPort, serial_packet_t *response);
-// void DisplayRawData(uint8_t *touchState, uint8_t *rawValue);
-void ReadAllThresholds(HANDLE hPort, serial_packet_t *response);
-
-bool ReadTouchSheet(HANDLE hPort, serial_packet_t *response);
-bool WriteTouchSheet(HANDLE hPort, serial_packet_t *response);
-void RemapTouchSheet();
-
-void ReadLatencySettings(HANDLE hPort, serial_packet_t *response);
-bool WriteLatencySettings(HANDLE hPort, serial_packet_t *response, uint8_t type, uint8_t value);
-void ModifyLatency();
-
-void SaveSettings();
-void LoadSettings();
-
-// Kobato函数声明
-void ConnectKobato();
-bool ReadKobatoStatus();
-void ReconnectKobato();
-
-void TryConnectDevice(bool isPlayer1);
-
-bool IsDataChanged();
-void ClearLine(int line);
-
-void DisplayFirmwareUpdateWindow();
-void StartFirmwareUpdate(void);
-bool FindFirmwareFile(void);
-void PrepareForFirmwareUpdate();
-void SetFirmwareStatusMessage(const char *msg);
 
 // 固件更新相关变量
 bool firmware_update_ready = false;          // 是否找到可更新的固件
@@ -194,29 +158,71 @@ int firmware_update_progress = 0;            // 更新进度 (0-100)
 wchar_t firmware_version[32] = L"v1.000000"; // 固件版本
 wchar_t firmware_path[MAX_PATH] = {0};       // 固件路径
 char *firmware_status_message = NULL;        // 状态信息
-
-/* ----- 固件更新相关常量 ----- */
-#define VID_CH340 0x1A86
-#define PID_CH340_G 0x7523
-#define PID_CH340_X 0x55D4
-#define BAUDRATE_BOOT 115200
-#define PAGE_SZ 256
-#define ERASE_RETRY 3
-#define SYNC_TIMEOUT_MS 2000
-
-/* ----- 固件更新全局变量 ----- */
 static HANDLE hBootPort = INVALID_HANDLE_VALUE;
 static unsigned char *firmware_data = NULL;
 static unsigned int firmware_data_len = 0;
 
+/* ---------- 函数声明 ---------- */
+// 阈值读取辅助函数
+uint16_t ReadThreshold(HANDLE hPort, serial_packet_t *response, int index);
+
+// 显示和UI相关函数
+void DisplayHeader(DeviceState state1p, DeviceState state2p);
+void DisplayMainWindow();
+void DisplayTouchPanelWindow();
+void DisplayFirmwareUpdateWindow();
+void SetCursorPosition(int x, int y);
+void ClearLine(int line);
+void ProcessTouchStateBytes(uint8_t state[7], bool touchMatrix[8][8]);
+void DisplayThresholds();
+void DisplayButtons();
+void UpdateFirmwareProgressOnly();
+
+// 操作和控制函数
+void SwitchWindow();
+void SwitchPlayer();
+void HandleKeyInput();
+void UpdateDeviceState();
+void TryConnectDevice(bool isPlayer1);
+void ReconnectDevices();
+void UpdateButtonLEDs();
+void UpdateTouchData();
+void UpdateMultiButtonState();
+bool IsDataChanged();
+
+// 阈值和触摸配置相关函数
+void ModifyThreshold();
+void InitThresholds();
+bool SendThreshold(HANDLE hPort, serial_packet_t *response, int index);
+void ReadAllThresholds(HANDLE hPort, serial_packet_t *response);
+bool ReadTouchSheet(HANDLE hPort, serial_packet_t *response);
+bool WriteTouchSheet(HANDLE hPort, serial_packet_t *response);
+void RemapTouchSheet();
+void ReadLatencySettings(HANDLE hPort, serial_packet_t *response);
+bool WriteLatencySettings(HANDLE hPort, serial_packet_t *response, uint8_t type, uint8_t value);
+void ModifyLatency();
+
+// 配置文件操作
+void SaveSettings();
+void LoadSettings();
+
+// Kobato设备函数
+void ConnectKobato();
+bool ReadKobatoStatus();
+void ReconnectKobato();
+
+// 固件更新相关函数
+void StartFirmwareUpdate(void);
+bool FindFirmwareFile(void);
+void PrepareForFirmwareUpdate();
+void SetFirmwareStatusMessage(const char *msg);
+
 // 阈值转换辅助函数
-static inline uint16_t threshold_to_display(uint16_t threshold)
-{
+static inline uint16_t threshold_to_display(uint16_t threshold) {
     return (uint16_t)((threshold * 999) / 32767);
 }
 
-static inline uint16_t display_to_threshold(uint16_t display)
-{
+static inline uint16_t display_to_threshold(uint16_t display) {
     return (uint16_t)((uint32_t)display * 32767 / 999);
 }
 
@@ -293,14 +299,24 @@ int main()
             if (currentWindow == WINDOW_MAIN)
             {
                 DisplayMainWindow();
+                firmwareWindowDrawn = false;
             }
             else if (currentWindow == WINDOW_TOUCHPANEL)
             {
                 DisplayTouchPanelWindow();
+                firmwareWindowDrawn = false;
             }
             else if (currentWindow == WINDOW_FIRMWARE_UPDATE)
             {
-                DisplayFirmwareUpdateWindow();
+                if (!firmwareWindowDrawn)
+                {
+                    DisplayFirmwareUpdateWindow();
+                    firmwareWindowDrawn = true;
+                }
+                else
+                {
+                    UpdateFirmwareProgressOnly();
+                }
             }
 
             dataChanged = false;
@@ -1531,6 +1547,7 @@ void HandleKeyInput()
         {
             currentWindow = WINDOW_MAIN;
             system("cls");
+            firmwareWindowDrawn = false; // 重置固件窗口绘制标志
             dataChanged = true;
         }
         break;
@@ -3329,7 +3346,7 @@ static void set_rts(HANDLE h, bool hi)
 static void enter_boot(HANDLE h)
 {
     set_dtr(h, false); /* BOOT0 = 1 */
-    set_rts(h, true); /* nRST = 0 */
+    set_rts(h, true);  /* nRST = 0 */
     Sleep(50);
     set_rts(h, false); /* 释放复位 */
     Sleep(100);
@@ -3338,7 +3355,7 @@ static void enter_boot(HANDLE h)
 static void exit_boot(HANDLE h)
 {
     set_dtr(h, true); /* BOOT0 = 0 */
-    set_rts(h, true);  /* nRST = 0 */
+    set_rts(h, true); /* nRST = 0 */
     Sleep(50);
     set_rts(h, false); /* nRST = 1 */
     Sleep(100);
@@ -3444,7 +3461,7 @@ static bool bl_write_block(HANDLE h, uint32_t addr, const unsigned char *buf, si
 
 static bool is_ch340(DWORD vid, DWORD pid)
 {
-    return vid == VID_CH340 && (pid == PID_CH340_G || pid == PID_CH340_X);
+    return vid == VID_CH340 && pid == PID_CH340;
 }
 
 /* ----- 查找和打开CH340设备 ----- */
@@ -3499,11 +3516,11 @@ DWORD WINAPI FindCH340Thread(LPVOID lpParam)
         if (sscanf(hwid, "USB\\VID_%4lx&PID_%4lx", &vid, &pid) != 2)
             continue;
 
-        if (vid == VID_CH340 && (pid == PID_CH340_G || pid == PID_CH340_X))
+        if (vid == VID_CH340 && pid == PID_CH340)
         {
             // 找到一个CH340设备
             ch340_count++;
-
+            
             // 如果发现多个设备，立即结束搜索
             if (ch340_count > 1)
             {
@@ -4009,7 +4026,7 @@ void DisplayFirmwareUpdateWindow()
 
     // 显示固件更新界面
     SetCursorPosition(0, 4);
-    printf("┌──────────────────────────── Curva Firmware Update ────────────────────────────┐");
+    printf("┌────────────────────────── Curva Firmware AutoUpdater ─────────────────────────┐");
 
     SetCursorPosition(0, 5);
     printf("│                                                                               │");
@@ -4021,9 +4038,16 @@ void DisplayFirmwareUpdateWindow()
     printf("│  Firmware Path: %-57.57S     │", firmware_path[0] ? firmware_path : L"No firmware file found");
 
     SetCursorPosition(0, 8);
-    printf("│                                                                               │");
+    printf("│  To use AutoUpdater, verify that the HW version is at least ");
+    SetConsoleTextAttribute(hConsole, COLOR_BLUE);
+    printf("v1.250515G");
+    SetConsoleTextAttribute(hConsole, defaultAttrs);
+    printf(".       │");
 
     SetCursorPosition(0, 9);
+    printf("│                                                                               │");
+
+    SetCursorPosition(0, 10);
     if (firmware_update_ready)
     {
         printf("│  Ready to update. Press Enter to start firmware update                        │");
@@ -4037,13 +4061,13 @@ void DisplayFirmwareUpdateWindow()
         printf("│");
     }
 
-    SetCursorPosition(0, 10);
+    SetCursorPosition(0, 11);
     printf("│                                                                               │");
 
     // 显示更新状态和进度条
     if (firmware_updating)
     {
-        SetCursorPosition(0, 11);
+        SetCursorPosition(0, 12);
         printf("│  Updating: [");
 
         // 绘制进度条 (50个字符宽度)
@@ -4064,10 +4088,10 @@ void DisplayFirmwareUpdateWindow()
 
         printf("] %3d%%          │", firmware_update_progress);
 
-        SetCursorPosition(0, 12);
+        SetCursorPosition(0, 13);
         printf("│                                                                               │");
 
-        SetCursorPosition(0, 13);
+        SetCursorPosition(0, 14);
         if (firmware_status_message)
         {
             printf("│  Status: %-69s│", firmware_status_message);
@@ -4079,10 +4103,10 @@ void DisplayFirmwareUpdateWindow()
     }
     else if (firmware_status_message)
     {
-        SetCursorPosition(0, 11);
+        SetCursorPosition(0, 12);
         printf("│                                                                               │");
 
-        SetCursorPosition(0, 12);
+        SetCursorPosition(0, 13);
         printf("│  Status: ");
 
         if (strstr(firmware_status_message, "Error") != NULL)
@@ -4104,37 +4128,103 @@ void DisplayFirmwareUpdateWindow()
         SetConsoleTextAttribute(hConsole, defaultAttrs);
         printf("│");
 
-        SetCursorPosition(0, 13);
+        SetCursorPosition(0, 14);
         printf("│                                                                               │");
     }
     else
     {
-        SetCursorPosition(0, 11);
-        printf("│                                                                               │");
-
         SetCursorPosition(0, 12);
         printf("│                                                                               │");
 
         SetCursorPosition(0, 13);
         printf("│                                                                               │");
+
+        SetCursorPosition(0, 14);
+        printf("│                                                                               │");
     }
 
     // 底部说明
-    SetCursorPosition(0, 14);
-    printf("│                                                                               │");
-
     SetCursorPosition(0, 15);
-    printf("│  ※ DO NOT disconnect power or USB connection during update                    │");
+    printf("│                                                                               │");
 
     SetCursorPosition(0, 16);
-    printf("│  ※ Device will automatically restart after update completes                   │");
+    printf("│  ※ DO NOT disconnect power or USB connection during update                    │");
 
     SetCursorPosition(0, 17);
-    printf("│                                                                               │");
+    printf("│  ※ Device will automatically restart after update completes                   │");
 
     SetCursorPosition(0, 18);
-    printf("│  Press [B] to return to Main View                                             │");
+    printf("│                                                                               │");
 
     SetCursorPosition(0, 19);
+    printf("│  Press [B] to return to Main View                                             │");
+
+    SetCursorPosition(0, 20);
     printf("└───────────────────────────────────────────────────────────────────────────────┘");
+}
+
+void UpdateFirmwareProgressOnly()
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    GetConsoleScreenBufferInfo(hConsole, &csbi);
+    WORD defaultAttrs = csbi.wAttributes;
+
+    // 只更新进度条和状态部分
+    if (firmware_updating)
+    {
+        // 更新进度条
+        SetCursorPosition(0, 12);
+        printf("│  Updating: [");
+
+        // 绘制进度条 (50个字符宽度)
+        const int bar_width = 50;
+        int filled = (firmware_update_progress * bar_width) / 100;
+
+        for (int i = 0; i < bar_width; i++)
+        {
+            if (i < filled)
+            {
+                printf("#");
+            }
+            else
+            {
+                printf(" ");
+            }
+        }
+
+        printf("] %3d%%          │", firmware_update_progress);
+    }
+
+    // 更新状态消息行
+    SetCursorPosition(0, 13);
+    printf("│                                                                               │");
+
+    SetCursorPosition(0, 14);
+    if (firmware_status_message)
+    {
+        printf("│  Status: ");
+
+        if (strstr(firmware_status_message, "Error") != NULL)
+        {
+            SetConsoleTextAttribute(hConsole, COLOR_RED);
+            printf("%-69s", firmware_status_message);
+        }
+        else if (strstr(firmware_status_message, "successful") != NULL ||
+                 strstr(firmware_status_message, "Update success") != NULL)
+        {
+            SetConsoleTextAttribute(hConsole, COLOR_GREEN);
+            printf("%-69s", firmware_status_message);
+        }
+        else
+        {
+            printf("%-69s", firmware_status_message);
+        }
+
+        SetConsoleTextAttribute(hConsole, defaultAttrs);
+        printf("│");
+    }
+    else
+    {
+        printf("│                                                                               │");
+    }
 }
