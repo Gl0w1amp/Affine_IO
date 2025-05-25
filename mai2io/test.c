@@ -21,7 +21,7 @@
 
 /* ---------- 常量定义 ---------- */
 // 版本号
-const char *VERSION = "v0.6.2";
+const char *VERSION = "v0.6.3";
 
 // 触摸和按键相关常量
 #define TOUCH_REGIONS 34        // 触摸区域总数
@@ -48,21 +48,24 @@ const char *VERSION = "v0.6.2";
 
 /* ---------- 类型定义 ---------- */
 // 设备状态枚举
-typedef enum {
+typedef enum
+{
     DEVICE_WAIT,
     DEVICE_FAIL,
     DEVICE_OK
 } DeviceState;
 
 // 窗口类型枚举
-typedef enum {
+typedef enum
+{
     WINDOW_MAIN,
     WINDOW_TOUCHPANEL,
     WINDOW_FIRMWARE_UPDATE
 } WindowType;
 
 // 连接参数结构体
-typedef struct {
+typedef struct
+{
     bool isPlayer1;
 } DeviceConnectParams;
 
@@ -80,7 +83,7 @@ extern void serial_writeresp(HANDLE hPortx, serial_packet_t *response);
 // 窗口和UI相关
 WindowType currentWindow = WINDOW_MAIN;
 HANDLE hConsole;
-int consoleWidth = 100;
+int consoleWidth = 120;
 int consoleHeight = 36;
 bool running = true;
 bool firmwareWindowDrawn = false;
@@ -162,6 +165,15 @@ static HANDLE hBootPort = INVALID_HANDLE_VALUE;
 static unsigned char *firmware_data = NULL;
 static unsigned int firmware_data_len = 0;
 
+// 自动映射相关变量
+bool autoRemapActive = false;            // 自动映射是否激活
+int autoRemapStage = 0;                  // 当前收集阶段（0-3）
+int autoRemapCollected = 0;              // 当前阶段已收集的区块数
+int autoRemapCompletedStages = 0;        // 已完成的阶段数（0-4）
+DWORD autoRemapLastTime = 0;             // 上次收集时间
+uint8_t autoRemapRegions[TOUCH_REGIONS]; // 记录按触发顺序收集的区块
+char autoRemapStatus[32] = {0};          // 状态消息
+
 /* ---------- 函数声明 ---------- */
 // 阈值读取辅助函数
 uint16_t ReadThreshold(HANDLE hPort, serial_packet_t *response, int index);
@@ -206,6 +218,13 @@ void ModifyLatency();
 void SaveSettings();
 void LoadSettings();
 
+// 自动映射相关函数
+void StartAutoRemap();            // 开始自动映射
+void StopAutoRemap(bool success); // 停止自动映射
+void UpdateAutoRemap();           // 更新自动映射状态
+void ProcessAutoRemapTouch();     // 处理自动映射时的触摸
+void CompleteAutoRemap();         // 完成自动映射并应用
+
 // Kobato设备函数
 void ConnectKobato();
 bool ReadKobatoStatus();
@@ -218,11 +237,13 @@ void PrepareForFirmwareUpdate();
 void SetFirmwareStatusMessage(const char *msg);
 
 // 阈值转换辅助函数
-static inline uint16_t threshold_to_display(uint16_t threshold) {
+static inline uint16_t threshold_to_display(uint16_t threshold)
+{
     return (uint16_t)((threshold * 999) / 32767);
 }
 
-static inline uint16_t display_to_threshold(uint16_t display) {
+static inline uint16_t display_to_threshold(uint16_t display)
+{
     return (uint16_t)((uint32_t)display * 32767 / 999);
 }
 
@@ -290,6 +311,12 @@ int main()
         // 更新设备状态和数据
         UpdateDeviceState();
         UpdateTouchData();
+
+        if (autoRemapActive)
+        {
+            UpdateAutoRemap();
+            ProcessAutoRemapTouch();
+        }
 
         // 只有数据变化时才刷新屏幕
         if (dataChanged || IsDataChanged())
@@ -841,22 +868,83 @@ void PrintTouchPanelTrigger(const char *text, char triggeredRegions[][3], int co
     {
         bool highlighted = false;
 
-        // 查找是否包含任何触发区域的标识符
-        for (int j = 0; j < count; j++)
+        // 首先尝试匹配长度为2的区域标识符（如A1,B2等）
+        if (i + 2 <= len &&
+            ((text[i] == 'A' || text[i] == 'B' || text[i] == 'C' ||
+              text[i] == 'D' || text[i] == 'E') &&
+             text[i + 1] >= '1' && text[i + 1] <= '8'))
         {
-            const char *region = triggeredRegions[j];
-            int regionLen = strlen(region);
+            char region[3] = {text[i], text[i + 1], '\0'};
 
-            if (i + regionLen <= len && strncmp(&text[i], region, regionLen) == 0)
+            // 检查是否是已完成阶段的区域
+            bool isCompletedRegion = false;
+
+            if (autoRemapActive && autoRemapCompletedStages > 0)
             {
-                // 找到触发区域的标识符，高亮显示
-                SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
-                printf("%s", region);
-                SetConsoleTextAttribute(hConsole, defaultAttrs);
+                char type = region[0];
+                int num = region[1] - '0';
 
-                i += regionLen;
+                if (autoRemapCompletedStages >= 1 && (type == 'A' || type == 'D'))
+                {
+                    isCompletedRegion = true; // 第一阶段完成: A1-A8, D1-D8
+                }
+                else if (autoRemapCompletedStages >= 2 && type == 'E')
+                {
+                    isCompletedRegion = true; // 第二阶段完成: E1-E8
+                }
+                else if (autoRemapCompletedStages >= 3 && type == 'B')
+                {
+                    isCompletedRegion = true; // 第三阶段完成: B1-B8
+                }
+                else if (autoRemapCompletedStages >= 4 && type == 'C' && num <= 2)
+                {
+                    isCompletedRegion = true; // 第四阶段完成: C1-C2
+                }
+            }
+
+            // 如果是已完成区域，绿色显示
+            if (isCompletedRegion)
+            {
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                printf("%c%c", region[0], region[1]);
+                SetConsoleTextAttribute(hConsole, defaultAttrs);
+                i += 2;
                 highlighted = true;
-                break;
+            }
+            // 否则检查是否是当前触发的区域
+            else
+            {
+                for (int j = 0; j < count && !highlighted; j++)
+                {
+                    if (strcmp(region, triggeredRegions[j]) == 0)
+                    {
+                        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
+                        printf("%c%c", region[0], region[1]);
+                        SetConsoleTextAttribute(hConsole, defaultAttrs);
+                        i += 2;
+                        highlighted = true;
+                    }
+                }
+            }
+        }
+
+        // 如果没有匹配2字符的区域，再尝试匹配3字符区域（如 D1D, A1A 等）
+        if (!highlighted && i + 3 <= len)
+        {
+            char region[4] = {text[i], text[i + 1], text[i + 2], '\0'};
+
+            for (int j = 0; j < count; j++)
+            {
+                const char *triggerRegion = triggeredRegions[j];
+                if (strlen(triggerRegion) == 3 && strcmp(region, triggerRegion) == 0)
+                {
+                    SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
+                    printf("%s", region);
+                    SetConsoleTextAttribute(hConsole, defaultAttrs);
+                    i += 3;
+                    highlighted = true;
+                    break;
+                }
             }
         }
 
@@ -939,60 +1027,113 @@ void DisplayTouchPanelWindow()
     // 绘制面板，高亮显示触发的区域
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("┌─────────────────────────── Touch Panel Test ───────────────────────────┐", triggeredRegions, count);
+    printf("   ┌───────── Touch Auto Remap ─────────┐");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│          ────────────────────────────────────────────────────          │", triggeredRegions, count);
+    printf("   │   Press [F4] to start Auto Remap   │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│        ╱                          D1                          ╲        │", triggeredRegions, count);
+    printf("   │                                    │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│       ╱              A8         D1D1D1         A1              ╲       │", triggeredRegions, count);
+    printf("   │   Once Auto Remap begins, trigger  │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│      ╱             A8A8                        A1A1             ╲      │", triggeredRegions, count);
+    printf("   │   the regions in clockwise order:  │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│     ╱                           E1E1E1                           ╲     │", triggeredRegions, count);
+    printf("   │         OUT -> MID -> INNER        │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│    ╱            D8                E1                D2            ╲    │", triggeredRegions, count);
+    printf("   │                                    │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│   ╱           D8D8    E8E8                  E2E2    D2D2           ╲   │", triggeredRegions, count);
+    printf("   │   After finishing each ring, wait  │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  ╱                    E8E8     B8    B1     E2E2                    ╲  │", triggeredRegions, count);
+    printf("   │   for that ring to turn green      │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │          A7                B8B8  B1B1                A2          │  │", triggeredRegions, count);
+    printf("   │   before moving on to the next.    │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │        A7A7         B7      B8    B1      B2         A2A2        │  │", triggeredRegions, count);
+    printf("   │                                    │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │                    B7B7                  B2B2                    │  │", triggeredRegions, count);
+    printf("   │   Triggering any other ring or     │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │      D7     E7      B7       C2  C1       B2      E3     D3      │  │", triggeredRegions, count);
+    printf("   │   waiting 15 seconds will end      │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │    D7     E7  E7           C2C2  C1C1           E3  E3     D3    │  │", triggeredRegions, count);
+    printf("   │   the scan.                        │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │      D7     E7      B6       C2  C1       B3      E3     D3      │  │", triggeredRegions, count);
+    printf("   │                                    │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │                    B6B6                  B3B3                    │  │", triggeredRegions, count);
+    printf("   │      The scan start from D1        │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │        A6A6         B6      B5    B4      B3         A3A3        │  │", triggeredRegions, count);
+    printf("   │                                    │");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  │          A6                B5B5  B4B4                A3          │  │", triggeredRegions, count);
+
+    printf("   │   Status: ");
+
+    // 添加状态显示
+    if (autoRemapActive || autoRemapStatus[0] != '\0')
+    {
+        if (autoRemapActive)
+        {
+            SetConsoleTextAttribute(hConsole, COLOR_BLUE);
+        }
+        else if (strstr(autoRemapStatus, "SUCCESS") != NULL)
+        {
+            SetConsoleTextAttribute(hConsole, COLOR_GREEN);
+        }
+        else if (strstr(autoRemapStatus, "ERROR") != NULL ||
+                 strstr(autoRemapStatus, "CANCELED") != NULL)
+        {
+            SetConsoleTextAttribute(hConsole, COLOR_RED);
+        }
+        printf("%-22s", autoRemapStatus);
+        SetConsoleTextAttribute(hConsole, defaultAttrs);
+    }
+    else
+    {
+        printf("                      ");
+    }
+    printf("   │");
+
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│  ╲                    E6E6     B5    B4     E4E4                   ╱   │", triggeredRegions, count);
+    printf("   │                                    │");
+
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│   ╲           D6D6    E6E6                  E4E4    D4D4          ╱    │", triggeredRegions, count);
+    printf("   └────────────────────────────────────┘");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│    ╲            D6                E5                D4           ╱     │", triggeredRegions, count);
+    printf("                                         ");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│     ╲                           E5E5E5                          ╱      │", triggeredRegions, count);
+    printf("                                         ");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│      ╲            A5A5                          A4A4           ╱       │", triggeredRegions, count);
+    printf("                                         ");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│       ╲             A5          D5D5D5          A4            ╱        │", triggeredRegions, count);
+    printf("                                         ");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│        ╲                          D5                         ╱         │", triggeredRegions, count);
+    printf("                                         ");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("│          ───────────────────────────────────────────────────           │", triggeredRegions, count);
-    SetCursorPosition(0, baseY++);
-    PrintTouchPanelTrigger("│            Trigger Threshold CAN BE Modified At Main View              │", triggeredRegions, count);
+    printf("                                         ");
     SetCursorPosition(0, baseY++);
     PrintTouchPanelTrigger("└────────────────────────────────────────────────────────────────────────┘", triggeredRegions, count);
+    printf("                                         ");
 }
 
 void ProcessTouchStateBytes(uint8_t state[7], bool touchMatrix[8][8])
@@ -1541,7 +1682,7 @@ void HandleKeyInput()
     case 27: // Esc键
         running = false;
         break;
-    case 'b': // 从固件更新界面返回
+    case 'b':
     case 'B':
         if (currentWindow == WINDOW_FIRMWARE_UPDATE && !firmware_updating)
         {
@@ -1610,6 +1751,28 @@ void HandleKeyInput()
                 currentWindow = WINDOW_FIRMWARE_UPDATE;
                 system("cls");
                 SetFirmwareStatusMessage(NULL);
+                dataChanged = true;
+            }
+            else if (currentWindow == WINDOW_FIRMWARE_UPDATE && !firmware_updating)
+            {
+                currentWindow = WINDOW_MAIN;
+                system("cls");
+                firmwareWindowDrawn = false; // 重置固件窗口绘制标志
+                dataChanged = true;
+            }
+            break;
+        case 62: // F4 - 自动映射
+            if (currentWindow == WINDOW_TOUCHPANEL &&
+                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK)))
+            {
+                if (!autoRemapActive)
+                {
+                    StartAutoRemap();
+                }
+                else
+                {
+                    StopAutoRemap(false); // 用户手动取消
+                }
                 dataChanged = true;
             }
             break;
@@ -3275,6 +3438,239 @@ void ModifyLatency()
     dataChanged = true;
 }
 
+void StartAutoRemap() 
+{
+    autoRemapActive = true;
+    autoRemapStage = 0;
+    autoRemapCollected = 0;
+    autoRemapCompletedStages = 0;
+    autoRemapLastTime = GetTickCount();
+    memset(autoRemapRegions, 0xFF, TOUCH_REGIONS); // 初始化为无效值
+    
+    // 设置初始状态
+    strcpy(autoRemapStatus, "COLLECTING ALL REGIONS");
+    dataChanged = true;
+}
+
+void StopAutoRemap(bool success)
+{
+    autoRemapActive = false;
+
+    if (success)
+    {
+        strcpy(autoRemapStatus, "SUCCESS");
+        CompleteAutoRemap();
+    }
+    else
+    {
+        strcpy(autoRemapStatus, "CANCELED");
+    }
+
+    dataChanged = true;
+}
+
+void UpdateAutoRemap() 
+{
+    if (!autoRemapActive) {
+        return;
+    }
+    
+    DWORD currentTime = GetTickCount();
+    
+    // 检查是否超时（15秒无操作）
+    if (currentTime - autoRemapLastTime > 15000) {
+        StopAutoRemap(false);
+        return;
+    }
+    
+    // 检查是否已经收集了所有区块
+    if (autoRemapCollected >= TOUCH_REGIONS) {
+        // 等待5秒确认无新触发
+        if (currentTime - autoRemapLastTime > 5000) {
+            // 所有区块收集完成
+            StopAutoRemap(true);
+        }
+    }
+}
+
+void ProcessAutoRemapTouch() 
+{
+    if (!autoRemapActive) {
+        return;
+    }
+
+    // 处理当前触摸状态
+    bool touchMatrix[8][8] = {false};
+    ProcessTouchStateBytes(usePlayer2 ? p2TouchState : p1TouchState, touchMatrix);
+
+    // 查找当前触发的区块
+    int currentTouched = -1;
+    int touchCount = 0;
+
+    // 区块索引映射
+    const struct {
+        int matrixX;
+        int matrixY;
+        int index;
+    } regionMapping[] = {
+        // D1-D8
+        {0, 0, 18}, {0, 1, 19}, {0, 2, 20}, {0, 3, 21}, {0, 4, 22}, {0, 5, 23}, {0, 6, 24}, {0, 7, 25},
+        // A1-A8
+        {1, 0, 0}, {1, 1, 1}, {1, 2, 2}, {1, 3, 3}, {1, 4, 4}, {1, 5, 5}, {1, 6, 6}, {1, 7, 7},
+        // E1-E8
+        {2, 0, 26}, {2, 1, 27}, {2, 2, 28}, {2, 3, 29}, {2, 4, 30}, {2, 5, 31}, {2, 6, 32}, {2, 7, 33},
+        // B1-B8
+        {3, 0, 8}, {3, 1, 9}, {3, 2, 10}, {3, 3, 11}, {3, 4, 12}, {3, 5, 13}, {3, 6, 14}, {3, 7, 15},
+        // C1-C2
+        {4, 0, 16}, {4, 1, 17}
+    };
+
+    // 检查触发状态
+    for (int i = 0; i < sizeof(regionMapping) / sizeof(regionMapping[0]); i++) {
+        int x = regionMapping[i].matrixX;
+        int y = regionMapping[i].matrixY;
+
+        if (touchMatrix[y][x]) {
+            currentTouched = regionMapping[i].index;
+            touchCount++;
+        }
+    }
+
+    // 仅当有且只有一个区块被触发时才处理
+    if (touchCount == 1 && currentTouched >= 0) {
+        // 检查此区块是否已被记录
+        bool alreadyRecorded = false;
+        for (int i = 0; i < TOUCH_REGIONS; i++) {
+            if (autoRemapRegions[i] == currentTouched) {
+                alreadyRecorded = true;
+                break;
+            }
+        }
+
+        // 直接记录任何未记录的区块
+        if (!alreadyRecorded) {
+            // 记录区块到下一个可用位置
+            autoRemapRegions[autoRemapCollected] = currentTouched;
+            autoRemapCollected++;
+            autoRemapLastTime = GetTickCount();
+            dataChanged = true;
+            
+            // 更新阶段状态显示（保持可视化反馈）
+            if (autoRemapCollected >= 16 && autoRemapStage == 0) {
+                autoRemapStage = 1;
+                autoRemapCompletedStages = 1;
+                strcpy(autoRemapStatus, "E1-E8 IN PROGRESS");
+            } else if (autoRemapCollected >= 24 && autoRemapStage == 1) {
+                autoRemapStage = 2;
+                autoRemapCompletedStages = 2;
+                strcpy(autoRemapStatus, "B1-B8 IN PROGRESS");
+            } else if (autoRemapCollected >= 32 && autoRemapStage == 2) {
+                autoRemapStage = 3;
+                autoRemapCompletedStages = 3;
+                strcpy(autoRemapStatus, "C1-C2 IN PROGRESS");
+            } else if (autoRemapCollected >= 34 && autoRemapStage == 3) {
+                // 所有区块都已收集完成
+                autoRemapCompletedStages = 4;
+                StopAutoRemap(true);
+            }
+        }
+    }
+}
+
+void CompleteAutoRemap()
+{
+    // 读取当前映射表
+    bool mappingRead = false;
+
+    if (deviceState1p == DEVICE_OK)
+    {
+        mappingRead = ReadTouchSheet(hPort1, &response1);
+    }
+    else if (deviceState2p == DEVICE_OK)
+    {
+        mappingRead = ReadTouchSheet(hPort2, &response2);
+    }
+
+    if (!mappingRead)
+    {
+        strcpy(autoRemapStatus, "ERROR: Failed to read mapping");
+        return;
+    }
+
+    // 创建标准区块索引数组
+    const uint8_t standardOrder[TOUCH_REGIONS] = {
+        // D1,A1,D2,A2,D3,A3,D4,A4,D5,A5,D6,A6,D7,A7,D8,A8,
+        18, 0, 19, 1, 20, 2, 21, 3, 22, 4, 23, 5, 24, 6, 25, 7,
+        // E1,E2,E3,E4,E5,E6,E7,E8,
+        26, 27, 28, 29, 30, 31, 32, 33,
+        // B1,B2,B3,B4,B5,B6,B7,B8,
+        8, 9, 10, 11, 12, 13, 14, 15,
+        // C1,C2
+        16, 17
+    };
+
+    // 创建新的映射表
+    uint8_t newTouchSheet[TOUCH_REGIONS];
+    memset(newTouchSheet, 0xFF, TOUCH_REGIONS); // 初始化为无效值
+
+    // 对于每个收集到的区块，找到它在标准顺序中对应的区块，然后创建映射
+    for (int i = 0; i < TOUCH_REGIONS; i++)
+    {
+        if (i < autoRemapCollected && autoRemapRegions[i] != 0xFF)
+        {
+            // 获取此位置收集到的区块索引
+            uint8_t collectedRegion = autoRemapRegions[i];
+            
+            // 找到标准顺序中的区块索引
+            uint8_t standardRegion = (i < TOUCH_REGIONS) ? standardOrder[i] : 0xFF;
+            
+            if (standardRegion != 0xFF)
+            {
+                // 创建映射: 通道collectedRegion -> 应该触发standardRegion
+                // 这意味着当用户触摸collectedRegion位置时，系统应该识别为standardRegion
+                newTouchSheet[collectedRegion] = standardRegion;
+            }
+        }
+    }
+
+    // 复制新映射表到全局变量
+    memcpy(touchSheet, newTouchSheet, TOUCH_REGIONS);
+
+    // 写入设备
+    bool success1p = false, success2p = false;
+
+    if (deviceState1p == DEVICE_OK)
+    {
+        success1p = WriteTouchSheet(hPort1, &response1);
+    }
+    if (deviceState2p == DEVICE_OK)
+    {
+        success2p = WriteTouchSheet(hPort2, &response2);
+    }
+
+    // 更新状态
+    if (success1p || success2p)
+    {
+        strcpy(autoRemapStatus, "SUCCESS: Mapping updated");
+
+        // 发送心跳以确保连接保持
+        if (success1p && deviceState1p == DEVICE_OK)
+        {
+            serial_heart_beat(hPort1, &response1);
+        }
+        if (success2p && deviceState2p == DEVICE_OK)
+        {
+            serial_heart_beat(hPort2, &response2);
+        }
+    }
+    else
+    {
+        strcpy(autoRemapStatus, "ERROR: Failed to write mapping");
+    }
+
+    dataChanged = true;
+}
+
 /*
 void DisplayRawData(uint8_t *touchState, uint8_t *rawValue)
 {
@@ -3520,7 +3916,7 @@ DWORD WINAPI FindCH340Thread(LPVOID lpParam)
         {
             // 找到一个CH340设备
             ch340_count++;
-            
+
             // 如果发现多个设备，立即结束搜索
             if (ch340_count > 1)
             {
@@ -4157,7 +4553,7 @@ void DisplayFirmwareUpdateWindow()
     printf("│                                                                               │");
 
     SetCursorPosition(0, 19);
-    printf("│  Press [B] to return to Main View                                             │");
+    printf("│  Press [F3] to return to Main View                                            │");
 
     SetCursorPosition(0, 20);
     printf("└───────────────────────────────────────────────────────────────────────────────┘");
