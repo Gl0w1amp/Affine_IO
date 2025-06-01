@@ -1729,16 +1729,16 @@ void HandleKeyInput()
         switch (key)
         {
         case 59: // F1
-            if (currentWindow != WINDOW_FIRMWARE_UPDATE &&
-                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK)))
+            if (currentWindow != WINDOW_FIRMWARE_UPDATE /*&&
+                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK))*/)
             {
                 ledButtonsTest = !ledButtonsTest;
                 dataChanged = true;
             }
             break;
         case 60: // F2
-            if (currentWindow != WINDOW_FIRMWARE_UPDATE &&
-                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK)))
+            if (currentWindow != WINDOW_FIRMWARE_UPDATE /*&&
+                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK))*/)
             {
                 ledControllerTest = !ledControllerTest;
                 dataChanged = true;
@@ -1762,8 +1762,8 @@ void HandleKeyInput()
             }
             break;
         case 62: // F4 - 自动映射
-            if (currentWindow == WINDOW_TOUCHPANEL &&
-                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK)))
+            if (currentWindow == WINDOW_TOUCHPANEL /*&&
+                ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK))*/)
             {
                 if (!autoRemapActive)
                 {
@@ -1779,31 +1779,43 @@ void HandleKeyInput()
         case 63: // F5
             if (currentWindow == WINDOW_MAIN)
             {
+                /*
                 if ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK))
                 {
+                */
                     ModifyThreshold();
                     dataChanged = true;
+                    /*
                 }
+                    */
             }
             break;
         case 64: // F6
             if (currentWindow == WINDOW_MAIN)
             {
+                /*
                 if ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK))
                 {
+                */
                     RemapTouchSheet();
                     dataChanged = true;
+                    /*
                 }
+                    */
             }
             break;
         case 65: // F7 - Modify Latency
             if (currentWindow == WINDOW_MAIN)
             {
+                /*
                 if ((usePlayer2 && deviceState2p == DEVICE_OK) || (!usePlayer2 && deviceState1p == DEVICE_OK))
                 {
+                */
                     ModifyLatency();
                     dataChanged = true;
+                    /*
                 }
+                    */
             }
             break;
         }
