@@ -1287,11 +1287,19 @@ void TryConnectDevice(bool isPlayer1)
     // 查找设备COM端口
     memcpy(comPort, GetSerialPortByVidPid(vid, pid), 6);
 
-    // 如果没找到设备，就保持WAIT状态，不尝试默认端口
     if (comPort[0] == 0)
     {
-        *pDeviceState = DEVICE_WAIT;
-        return;
+        if (isPlayer1)
+        {
+            // 对于1P设备，使用默认端口COM11
+            snprintf(comPort, 12, "\\\\.\\COM11");
+        }
+        else
+        {
+            // 2P设备不使用默认端口，保持WAIT状态
+            *pDeviceState = DEVICE_WAIT;
+            return;
+        }
     }
     else
     {
@@ -1379,10 +1387,8 @@ void ReconnectDevices()
         // 处理COM端口格式
         if (comPort1[0] == 0)
         {
-            // 如果无法通过VID/PID找到设备，不再使用默认端口
-            deviceState1p = DEVICE_WAIT;
-            dataChanged = true;
-            return;
+            // 如果无法通过VID/PID找到设备，使用默认端口COM11
+            snprintf(comPort1, 12, "\\\\.\\COM11");
         }
         else
         {
