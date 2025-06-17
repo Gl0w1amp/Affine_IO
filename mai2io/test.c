@@ -21,7 +21,7 @@
 
 /* ---------- 常量定义 ---------- */
 // 版本号
-const char *VERSION = "v0.6.3";
+const char *VERSION = "v0.6.5";
 
 // 触摸和按键相关常量
 #define TOUCH_REGIONS 34        // 触摸区域总数
@@ -97,8 +97,8 @@ bool isFirstConnection2p = TRUE;
 bool usePlayer2 = FALSE; // 控制是否切换到2P模式
 
 // 设备连接配置
-char *Vid = "VID_AFF1";
-char *Pid_1p = "PID_52A5";
+char *Vid = "VID_0483";
+char *Pid_1p = "PID_52A4";
 char *Pid_2p = "PID_52A6";
 char *Vid_Kobato = "VID_0483";
 char *Pid_Kobato = "PID_5740";
@@ -1292,7 +1292,7 @@ void TryConnectDevice(bool isPlayer1)
         if (isPlayer1)
         {
             // 对于1P设备，使用默认端口COM11
-            snprintf(comPort, 12, "\\\\.\\COM11");
+            // snprintf(comPort, 12, "\\\\.\\COM11");
         }
         else
         {
@@ -1388,7 +1388,7 @@ void ReconnectDevices()
         if (comPort1[0] == 0)
         {
             // 如果无法通过VID/PID找到设备，使用默认端口COM11
-            snprintf(comPort1, 12, "\\\\.\\COM11");
+            // snprintf(comPort1, 12, "\\\\.\\COM11");
         }
         else
         {
