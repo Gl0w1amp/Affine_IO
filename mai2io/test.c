@@ -21,7 +21,7 @@
 
 /* ---------- 常量定义 ---------- */
 // 版本号
-const char *VERSION = "v0.6.5";
+const char *VERSION = "v0.6.6rc1";
 
 // 触摸和按键相关常量
 #define TOUCH_REGIONS 34        // 触摸区域总数
@@ -97,8 +97,8 @@ bool isFirstConnection2p = TRUE;
 bool usePlayer2 = FALSE; // 控制是否切换到2P模式
 
 // 设备连接配置
-char *Vid = "VID_0483";
-char *Pid_1p = "PID_52A4";
+char *Vid = "VID_AFF1";
+char *Pid_1p = "PID_52A5";
 char *Pid_2p = "PID_52A6";
 char *Vid_Kobato = "VID_0483";
 char *Pid_Kobato = "PID_5740";
@@ -2317,7 +2317,7 @@ bool ReadTouchSheet(HANDLE hPort, serial_packet_t *response)
 
         Sleep(5);
 
-    } while (currentTime - startTime < 2000);
+    } while (currentTime - startTime < 4000);
 
     if (headerReceived && bytesReceived >= TOUCH_REGIONS + 3)
     {
