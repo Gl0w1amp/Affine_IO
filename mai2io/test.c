@@ -21,7 +21,7 @@
 
 /* ---------- 常量定义 ---------- */
 // 版本号
-const char *VERSION = "v0.6.6rc1";
+const char *VERSION = "v0.6.6rc1.1";
 
 // 触摸和按键相关常量
 #define TOUCH_REGIONS 34        // 触摸区域总数
@@ -1285,9 +1285,9 @@ void TryConnectDevice(bool isPlayer1)
     // Sleep(50);
 
     // 查找设备COM端口
-    memcpy(comPort, GetSerialPortByVidPid(vid, pid), 6);
-
-    if (comPort[0] == 0)
+    char* foundPort = GetSerialPortByVidPid(vid, pid);
+    
+    if (foundPort[0] == 0)
     {
         if (isPlayer1)
         {
@@ -1303,16 +1303,8 @@ void TryConnectDevice(bool isPlayer1)
     }
     else
     {
-        // 统一处理COM端口号
-        int port_num;
-        if (comPort[4] == 0)
-            port_num = (comPort[3] - '0'); // 单位数
-        else if (comPort[5] == 0)
-            port_num = (comPort[3] - '0') * 10 + (comPort[4] - '0'); // 两位数
-        else
-            port_num = (comPort[3] - '0') * 100 + (comPort[4] - '0') * 10 + (comPort[5] - '0'); // 三位数
-
-        snprintf(comPort, 12, "\\\\.\\COM%d", port_num);
+        // 直接使用找到的端口名，添加Windows命名空间前缀
+        snprintf(comPort, 12, "\\\\.\\%s", foundPort);
     }
 
     // 多次尝试连接
@@ -1338,18 +1330,10 @@ void TryConnectDevice(bool isPlayer1)
             // Sleep(50);
 
             // 每次重试前重新搜索设备
-            memcpy(comPort, GetSerialPortByVidPid(vid, pid), 6);
-            if (comPort[0] != 0)
+            char* foundPortRetry = GetSerialPortByVidPid(vid, pid);
+            if (foundPortRetry[0] != 0)
             {
-                int port_num;
-                if (comPort[4] == 0)
-                    port_num = (comPort[3] - '0');
-                else if (comPort[5] == 0)
-                    port_num = (comPort[3] - '0') * 10 + (comPort[4] - '0');
-                else
-                    port_num = (comPort[3] - '0') * 100 + (comPort[4] - '0') * 10 + (comPort[5] - '0');
-
-                snprintf(comPort, 12, "\\\\.\\COM%d", port_num);
+                snprintf(comPort, 12, "\\\\.\\%s", foundPortRetry);
             }
         }
     }
@@ -1382,26 +1366,18 @@ void ReconnectDevices()
         dataChanged = true;
 
         // Sleep(100);
-        memcpy(comPort1, GetSerialPortByVidPid(Vid, Pid_1p), 6);
+        char* foundPort1p = GetSerialPortByVidPid(Vid, Pid_1p);
 
         // 处理COM端口格式
-        if (comPort1[0] == 0)
+        if (foundPort1p[0] == 0)
         {
             // 如果无法通过VID/PID找到设备，使用默认端口COM11
             // snprintf(comPort1, 12, "\\\\.\\COM11");
         }
         else
         {
-            // 统一处理COM端口号，简化代码
-            int port_num;
-            if (comPort1[4] == 0)
-                port_num = (comPort1[3] - '0'); // 单位数
-            else if (comPort1[5] == 0)
-                port_num = (comPort1[3] - '0') * 10 + (comPort1[4] - '0'); // 两位数
-            else
-                port_num = (comPort1[3] - '0') * 100 + (comPort1[4] - '0') * 10 + (comPort1[5] - '0'); // 三位数
-
-            snprintf(comPort1, 12, "\\\\.\\COM%d", port_num);
+            // 直接使用找到的端口名，添加Windows命名空间前缀
+            snprintf(comPort1, 12, "\\\\.\\%s", foundPort1p);
         }
 
         // 尝试多次连接
@@ -1432,10 +1408,10 @@ void ReconnectDevices()
         dataChanged = true;
 
         // Sleep(100);
-        memcpy(comPort2, GetSerialPortByVidPid(Vid, Pid_2p), 6);
+        char* foundPort2p = GetSerialPortByVidPid(Vid, Pid_2p);
 
         // 处理COM端口格式（使用相同的简化逻辑）
-        if (comPort2[0] == 0)
+        if (foundPort2p[0] == 0)
         {
             // 不连接到默认端口
             deviceState2p = DEVICE_WAIT;
@@ -1443,15 +1419,8 @@ void ReconnectDevices()
         }
         else
         {
-            int port_num;
-            if (comPort2[4] == 0)
-                port_num = (comPort2[3] - '0');
-            else if (comPort2[5] == 0)
-                port_num = (comPort2[3] - '0') * 10 + (comPort2[4] - '0');
-            else
-                port_num = (comPort2[3] - '0') * 100 + (comPort2[4] - '0') * 10 + (comPort2[5] - '0');
-
-            snprintf(comPort2, 12, "\\\\.\\COM%d", port_num);
+            // 直接使用找到的端口名，添加Windows命名空间前缀
+            snprintf(comPort2, 12, "\\\\.\\%s", foundPort2p);
         }
 
         // 尝试多次连接
@@ -2646,24 +2615,16 @@ void ConnectKobato()
     Sleep(200);
 
     // 尝试通过VID/PID获取Kobato设备的COM端口
-    memcpy(comPortKobato, GetSerialPortByVidPid(Vid_Kobato, Pid_Kobato), 6);
-    if (comPortKobato[0] == 0)
+    char* foundPortKobato = GetSerialPortByVidPid(Vid_Kobato, Pid_Kobato);
+    if (foundPortKobato[0] == 0)
     {
         // 如果找不到设备，状态保持为WAIT
         deviceStateKobato = DEVICE_WAIT;
         return;
     }
 
-    // 处理端口号格式（使用简化的统一逻辑）
-    int port_num;
-    if (comPortKobato[4] == 0)
-        port_num = (comPortKobato[3] - '0');
-    else if (comPortKobato[5] == 0)
-        port_num = (comPortKobato[3] - '0') * 10 + (comPortKobato[4] - '0');
-    else
-        port_num = (comPortKobato[3] - '0') * 100 + (comPortKobato[4] - '0') * 10 + (comPortKobato[5] - '0');
-
-    snprintf(comPortKobato, 12, "\\\\.\\COM%d", port_num);
+    // 直接使用找到的端口名，添加Windows命名空间前缀
+    snprintf(comPortKobato, 12, "\\\\.\\%s", foundPortKobato);
 
     // 重试连接几次
     HANDLE tempPort = INVALID_HANDLE_VALUE;
