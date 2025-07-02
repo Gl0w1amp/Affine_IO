@@ -21,12 +21,12 @@
 
 /* ---------- 常量定义 ---------- */
 // 版本号
-const char *VERSION = "v0.6.6rc1.1";
+const char *VERSION = "v0.6.6rc2";
 
 // 触摸和按键相关常量
 #define TOUCH_REGIONS 34        // 触摸区域总数
 #define BUTTONS_COUNT 8         // 按钮总数
-#define THRESHOLD_DEFAULT 16384 // 默认阈值
+#define THRESHOLD_DEFAULT 32767 // 默认阈值
 
 // 连接和重连常量
 #define INIT_CONNECT_ATTEMPTS 5
@@ -173,6 +173,8 @@ int autoRemapCompletedStages = 0;        // 已完成的阶段数（0-4）
 DWORD autoRemapLastTime = 0;             // 上次收集时间
 uint8_t autoRemapRegions[TOUCH_REGIONS]; // 记录按触发顺序收集的区块
 char autoRemapStatus[32] = {0};          // 状态消息
+bool autoRemapCompletedRegions[TOUCH_REGIONS] = {false}; // 标记已完成的区块
+uint8_t prevTouchMatrix[8][8] = {0};     // 上一帧的触摸状态矩阵
 
 /* ---------- 函数声明 ---------- */
 // 阈值读取辅助函数
@@ -876,29 +878,31 @@ void PrintTouchPanelTrigger(const char *text, char triggeredRegions[][3], int co
         {
             char region[3] = {text[i], text[i + 1], '\0'};
 
-            // 检查是否是已完成阶段的区域
+            // 检查是否是已完成的区域（实时检查）
             bool isCompletedRegion = false;
 
-            if (autoRemapActive && autoRemapCompletedStages > 0)
-            {
+            if (autoRemapActive) {
+                // 将区域名称转换为索引以检查是否已完成
+                int regionIndex = -1;
                 char type = region[0];
                 int num = region[1] - '0';
 
-                if (autoRemapCompletedStages >= 1 && (type == 'A' || type == 'D'))
-                {
-                    isCompletedRegion = true; // 第一阶段完成: A1-A8, D1-D8
+                // 根据区域类型和编号计算索引
+                if (type == 'A') {
+                    regionIndex = num - 1; // A1-A8 -> 0-7
+                } else if (type == 'B') {
+                    regionIndex = num + 7; // B1-B8 -> 8-15
+                } else if (type == 'C') {
+                    regionIndex = num + 15; // C1-C2 -> 16-17
+                } else if (type == 'D') {
+                    regionIndex = num + 17; // D1-D8 -> 18-25
+                } else if (type == 'E') {
+                    regionIndex = num + 25; // E1-E8 -> 26-33
                 }
-                else if (autoRemapCompletedStages >= 2 && type == 'E')
-                {
-                    isCompletedRegion = true; // 第二阶段完成: E1-E8
-                }
-                else if (autoRemapCompletedStages >= 3 && type == 'B')
-                {
-                    isCompletedRegion = true; // 第三阶段完成: B1-B8
-                }
-                else if (autoRemapCompletedStages >= 4 && type == 'C' && num <= 2)
-                {
-                    isCompletedRegion = true; // 第四阶段完成: C1-C2
+
+                // 检查该区域是否已完成
+                if (regionIndex >= 0 && regionIndex < TOUCH_REGIONS) {
+                    isCompletedRegion = autoRemapCompletedRegions[regionIndex];
                 }
             }
 
@@ -3425,6 +3429,8 @@ void StartAutoRemap()
     autoRemapCompletedStages = 0;
     autoRemapLastTime = GetTickCount();
     memset(autoRemapRegions, 0xFF, TOUCH_REGIONS); // 初始化为无效值
+    memset(autoRemapCompletedRegions, false, TOUCH_REGIONS); // 清空已完成标记
+    memset(prevTouchMatrix, 0, sizeof(prevTouchMatrix)); // 清空上一帧触摸状态
     
     // 设置初始状态
     strcpy(autoRemapStatus, "COLLECTING ALL REGIONS");
@@ -3479,12 +3485,8 @@ void ProcessAutoRemapTouch()
     }
 
     // 处理当前触摸状态
-    bool touchMatrix[8][8] = {false};
-    ProcessTouchStateBytes(usePlayer2 ? p2TouchState : p1TouchState, touchMatrix);
-
-    // 查找当前触发的区块
-    int currentTouched = -1;
-    int touchCount = 0;
+    bool currentTouchMatrix[8][8] = {false};
+    ProcessTouchStateBytes(usePlayer2 ? p2TouchState : p1TouchState, currentTouchMatrix);
 
     // 区块索引映射
     const struct {
@@ -3504,56 +3506,50 @@ void ProcessAutoRemapTouch()
         {4, 0, 16}, {4, 1, 17}
     };
 
-    // 检查触发状态
+    // 找到新触发的区块（当前触发但上一帧未触发的区块）
     for (int i = 0; i < sizeof(regionMapping) / sizeof(regionMapping[0]); i++) {
         int x = regionMapping[i].matrixX;
         int y = regionMapping[i].matrixY;
+        int regionIndex = regionMapping[i].index;
 
-        if (touchMatrix[y][x]) {
-            currentTouched = regionMapping[i].index;
-            touchCount++;
-        }
-    }
-
-    // 仅当有且只有一个区块被触发时才处理
-    if (touchCount == 1 && currentTouched >= 0) {
-        // 检查此区块是否已被记录
-        bool alreadyRecorded = false;
-        for (int i = 0; i < TOUCH_REGIONS; i++) {
-            if (autoRemapRegions[i] == currentTouched) {
-                alreadyRecorded = true;
-                break;
+        // 检查是否是新触发的区块（当前触发且上一帧未触发）
+        bool isNewTouch = currentTouchMatrix[y][x] && !prevTouchMatrix[y][x];
+        
+        if (isNewTouch) {
+            // 检查此区块是否已被记录
+            bool alreadyRecorded = false;
+            for (int j = 0; j < autoRemapCollected; j++) {
+                if (autoRemapRegions[j] == regionIndex) {
+                    alreadyRecorded = true;
+                    break;
+                }
             }
-        }
 
-        // 直接记录任何未记录的区块
-        if (!alreadyRecorded) {
-            // 记录区块到下一个可用位置
-            autoRemapRegions[autoRemapCollected] = currentTouched;
-            autoRemapCollected++;
-            autoRemapLastTime = GetTickCount();
-            dataChanged = true;
-            
-            // 更新阶段状态显示（保持可视化反馈）
-            if (autoRemapCollected >= 16 && autoRemapStage == 0) {
-                autoRemapStage = 1;
-                autoRemapCompletedStages = 1;
-                strcpy(autoRemapStatus, "E1-E8 IN PROGRESS");
-            } else if (autoRemapCollected >= 24 && autoRemapStage == 1) {
-                autoRemapStage = 2;
-                autoRemapCompletedStages = 2;
-                strcpy(autoRemapStatus, "B1-B8 IN PROGRESS");
-            } else if (autoRemapCollected >= 32 && autoRemapStage == 2) {
-                autoRemapStage = 3;
-                autoRemapCompletedStages = 3;
-                strcpy(autoRemapStatus, "C1-C2 IN PROGRESS");
-            } else if (autoRemapCollected >= 34 && autoRemapStage == 3) {
-                // 所有区块都已收集完成
-                autoRemapCompletedStages = 4;
-                StopAutoRemap(true);
+            // 如果是新区块，记录它
+            if (!alreadyRecorded) {
+                // 记录区块到下一个可用位置
+                autoRemapRegions[autoRemapCollected] = regionIndex;
+                autoRemapCompletedRegions[regionIndex] = true; // 标记为已完成
+                autoRemapCollected++;
+                autoRemapLastTime = GetTickCount();
+                dataChanged = true;
+                
+                // 实时更新进度状态
+                if (autoRemapCollected >= 34) {
+                    // 所有区块都已收集完成
+                    autoRemapCompletedStages = 4;
+                    strcpy(autoRemapStatus, "ALL REGIONS COLLECTED");
+                    StopAutoRemap(true);
+                } else {
+                    // 更新收集进度状态
+                    snprintf(autoRemapStatus, sizeof(autoRemapStatus), "COLLECTED: %d/34", autoRemapCollected);
+                }
             }
         }
     }
+
+    // 更新上一帧的触摸状态
+    memcpy(prevTouchMatrix, currentTouchMatrix, sizeof(prevTouchMatrix));
 }
 
 void CompleteAutoRemap()
