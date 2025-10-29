@@ -3,17 +3,55 @@ name: Build Affine IO-Chuni
 on:
   push:
     branches: [ main, master ]
-    paths:
-      - 'chuniio/**'
+    tags: [ '*' ]
   pull_request:
     branches: [ main, master ]
     paths:
       - 'chuniio/**'
+  release:
+    types: [ published ]
   workflow_dispatch:
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_build: ${{ steps.final.outputs.run_build }}
+    steps:
+      - id: pre
+        run: |
+          if [ "${{ github.event_name }}" = "release" ] || [[ "${{ github.ref }}" == refs/tags/* ]] || [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "run_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_build=" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.pre.outputs.run_build == ''
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - if: steps.pre.outputs.run_build == ''
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            chuniio:
+              - 'chuniio/**'
+      - id: final
+        run: |
+          if [ -n "${{ steps.pre.outputs.run_build }}" ]; then
+            echo "run_build=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ "${{ steps.filter.outputs.chuniio }}" = "true" ]; then
+              echo "run_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run_build=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   build:
     runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.run_build == 'true'
     defaults:
       run:
         shell: msys2 {0}
@@ -53,7 +91,7 @@ jobs:
           path: chuniio/chuni_test.exe
 
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: |
@@ -61,3 +99,50 @@ jobs:
             chuniio/chuni_test.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install AWS CLI
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        shell: powershell
+        run: |
+          choco install awscli -y
+          aws --version
+
+      - name: Upload DLL to Cloudflare R2 (tag subdir + latest.json)
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        shell: powershell
+        working-directory: chuniio
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "release") { "${{ github.event.release.tag_name }}" } else { "${{ github.ref_name }}" }
+
+          $base = "s3://$env:R2_BUCKET/public/scripts/affine/chuniio"
+          $dest = "$base/$tag/"
+
+          aws s3 cp "chuniio_affine.dll" "$dest" `
+            --endpoint-url "$env:R2_ENDPOINT" `
+            --cache-control "public,max-age=31536000,immutable"
+
+          $hash = (Get-FileHash "chuniio_affine.dll" -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item "chuniio_affine.dll").Length
+          $manifestObj = @{
+            version     = $tag
+            file        = "chuniio_affine.dll"
+            size        = $size
+            sha256      = $hash
+            path        = "/public/scripts/affine/chuniio/$tag/chuniio_affine.dll"
+            uploaded_at = (Get-Date).ToString("s")
+          }
+          $manifestJson = $manifestObj | ConvertTo-Json -Compress
+          $manifestJson | Out-File -Encoding utf8 "manifest.json"
+          aws s3 cp "manifest.json" "$dest" `
+            --endpoint-url "$env:R2_ENDPOINT" `
+            --cache-control "public,max-age=31536000,immutable"
+
+          $manifestJson | Out-File -Encoding utf8 "latest.json"
+          aws s3 cp "latest.json" "$base/latest.json" `
+            --endpoint-url "$env:R2_ENDPOINT" `
+            --cache-control "public,max-age=60"

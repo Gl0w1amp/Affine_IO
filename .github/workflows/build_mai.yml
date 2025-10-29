@@ -92,7 +92,7 @@ jobs:
           name: curva_test-exe
           path: mai2io/curva_test.exe
 
-      - name: Create Release (for tag push only)
+      - name: Create Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
@@ -121,7 +121,7 @@ jobs:
         run: |
           $tag = if ("${{ github.event_name }}" -eq "release") { "${{ github.event.release.tag_name }}" } else { "${{ github.ref_name }}" }
 
-          $base = "s3://$env:R2_BUCKET/ruminasu/public/scripts/affine/mai2io"
+          $base = "s3://$env:R2_BUCKET/public/scripts/affine/mai2io"
           $dest = "$base/$tag/"
 
           aws s3 cp "mai2io_affine.dll" "$dest" `
@@ -135,7 +135,7 @@ jobs:
             file        = "mai2io_affine.dll"
             size        = $size
             sha256      = $hash
-            path        = "/ruminasu/public/scripts/affine/mai2io/$tag/mai2io_affine.dll"
+            path        = "/public/scripts/affine/mai2io/$tag/mai2io_affine.dll"
             uploaded_at = (Get-Date).ToString("s")
           }
           $manifestJson = $manifestObj | ConvertTo-Json -Compress
