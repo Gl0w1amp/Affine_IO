@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <conio.h>
+#include <string.h>
 #include <wchar.h>
 #include <setupapi.h>
 #include <devguid.h>
@@ -15,6 +16,7 @@
 /* ---------- 项目头文件 ---------- */
 #include "serial.h"
 #include "dprintf.h"
+#include "dfu_loader.h"
 
 /* ---------- 调试设置 ---------- */
 // #define DEBUG
@@ -40,12 +42,6 @@ const char *VERSION = "v0.8c";
 #define COLOR_DEFAULT (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
 
 // 固件更新相关常量
-#define VID_CH340 0x1A86
-#define PID_CH340 0x7523
-#define BAUDRATE_BOOT 115200
-#define PAGE_SZ 256
-#define ERASE_RETRY 3
-#define SYNC_TIMEOUT_MS 2000
 
 /* ---------- 类型定义 ---------- */
 // 设备状态枚举
@@ -171,7 +167,46 @@ bool heartbeatEnabled = true;         // 心跳是否启用
 DWORD heartbeatPauseStartTime = 0;    // 心跳暂停开始时间
 
 // 固件更新相关变量
-bool firmware_update_ready = false;          // 是否找到可更新的固件
+bool firmware_update_ready = false;
+static volatile LONG dfu_request_flag = 0;
+static volatile LONG dfu_request_done = 0;
+static volatile LONG dfu_request_success = 0;
+typedef struct
+{
+    bool attempted;
+    bool success;
+    DWORD bytes_written;
+    DWORD error_code;
+    char source[32];
+} dfu_send_info_t;
+
+static dfu_send_info_t dfu_last_send = {0};
+
+static void dfu_reset_last_send_info(void)
+{
+    dfu_last_send.attempted = false;
+    dfu_last_send.success = false;
+    dfu_last_send.bytes_written = 0;
+    dfu_last_send.error_code = 0;
+    memset(dfu_last_send.source, 0, sizeof(dfu_last_send.source));
+}
+
+static void dfu_set_last_send_info(const char *source, bool success, DWORD bytes, DWORD err)
+{
+    dfu_last_send.attempted = true;
+    dfu_last_send.success = success;
+    dfu_last_send.bytes_written = bytes;
+    dfu_last_send.error_code = err;
+    if (source)
+    {
+        strncpy_s(dfu_last_send.source, sizeof(dfu_last_send.source), source, _TRUNCATE);
+    }
+    else
+    {
+        dfu_last_send.source[0] = '\0';
+    }
+}
+          // 是否找到可更新的固件
 bool firmware_updating = false;              // 是否正在更新
 int firmware_update_progress = 0;            // 更新进度 (0-100)
 wchar_t firmware_version[32] = L"v1.000000"; // 固件版本
@@ -280,6 +315,140 @@ static inline uint16_t threshold_to_display(uint16_t threshold)
     return (result < 999) ? (result + 1) : 999;
 }
 
+
+bool FindFirmwareFile(void)
+{
+    wchar_t exe_path[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exe_path, MAX_PATH) == 0) {
+        return false;
+    }
+
+    wchar_t *last_slash = wcsrchr(exe_path, L'\\');
+    if (last_slash != NULL) {
+        *(last_slash + 1) = L'\0';
+    }
+
+    wchar_t search_pattern[MAX_PATH];
+    wcscpy_s(search_pattern, MAX_PATH, exe_path);
+    wcscat_s(search_pattern, MAX_PATH, L"Curva_G431_*.bin");
+
+    WIN32_FIND_DATAW find_data;
+    HANDLE find_handle = FindFirstFileW(search_pattern, &find_data);
+    if (find_handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    unsigned long long latest_version = 0;
+    wchar_t latest_filename[MAX_PATH] = {0};
+
+    do {
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            continue;
+        }
+
+        const wchar_t *prefix = L"Curva_G431_";
+        size_t prefix_len = wcslen(prefix);
+        if (wcsncmp(find_data.cFileName, prefix, prefix_len) != 0) {
+            continue;
+        }
+
+        const wchar_t *version_start = find_data.cFileName + prefix_len;
+        size_t version_len = wcslen(version_start);
+        if (version_len > 4 && wcscmp(version_start + version_len - 4, L".bin") == 0) {
+            version_len -= 4;
+        }
+
+        if (version_len >= 32) {
+            continue;
+        }
+
+        wchar_t version_str[32];
+        wcsncpy_s(version_str, 32, version_start, version_len);
+        version_str[version_len] = L'\0';
+        unsigned long long version = wcstoull(version_str, NULL, 10);
+        if (version > latest_version) {
+            latest_version = version;
+            wcscpy_s(latest_filename, MAX_PATH, find_data.cFileName);
+        }
+    } while (FindNextFileW(find_handle, &find_data) != 0);
+
+    FindClose(find_handle);
+
+    if (latest_filename[0] == L'\0') {
+        return false;
+    }
+
+    wcscpy_s(firmware_path, MAX_PATH, exe_path);
+    wcscat_s(firmware_path, MAX_PATH, latest_filename);
+
+    memset(firmware_version, 0, sizeof(firmware_version));
+    const wchar_t *prefix = L"Curva_G431_";
+    size_t prefix_len = wcslen(prefix);
+    if (wcslen(latest_filename) > prefix_len) {
+        wchar_t version_str[32] = {0};
+        wcscpy_s(version_str, 32, latest_filename + prefix_len);
+        wchar_t *dot = wcsrchr(version_str, L'.');
+        if (dot != NULL) {
+            *dot = L'\0';
+        }
+        swprintf_s(firmware_version, 32, L"v1.%s", version_str);
+    }
+
+    FILE *f = NULL;
+    if (_wfopen_s(&f, firmware_path, L"rb") != 0 || f == NULL) {
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_size <= 0) {
+        fclose(f);
+        return false;
+    }
+
+    if (firmware_data != NULL) {
+        free(firmware_data);
+        firmware_data = NULL;
+    }
+
+    firmware_data = (unsigned char *)malloc(file_size);
+    if (!firmware_data) {
+        fclose(f);
+        return false;
+    }
+
+    if (fread(firmware_data, 1, file_size, f) != (size_t)file_size) {
+        fclose(f);
+        free(firmware_data);
+        firmware_data = NULL;
+        return false;
+    }
+
+    fclose(f);
+    firmware_data_len = (unsigned int)file_size;
+    return true;
+}
+
+void SetFirmwareStatusMessage(const char *msg)
+{
+    if (firmware_status_message != NULL) {
+        free(firmware_status_message);
+        firmware_status_message = NULL;
+    }
+
+    if (msg != NULL) {
+        size_t len = strlen(msg) + 1;
+        firmware_status_message = (char *)malloc(len);
+        if (firmware_status_message != NULL) {
+            strcpy_s(firmware_status_message, len, msg);
+        }
+    }
+
+    dataChanged = true;
+}
+
 // 格式化阈值显示，读取失败时显示UNK
 static inline void format_threshold_display(char *buffer, int index)
 {
@@ -310,6 +479,8 @@ static inline uint16_t display_to_threshold(uint16_t display)
     // 简单整数除法
     return (uint16_t)((uint32_t)display * 16384 / 999);
 }
+
+static bool process_dfu_request(void);
 
 int main()
 {
@@ -378,6 +549,13 @@ int main()
         // 更新设备状态和数据
         UpdateDeviceState();
         UpdateTouchData();
+
+        if (InterlockedCompareExchange(&dfu_request_flag, 0, 0) != 0 &&
+            InterlockedCompareExchange(&dfu_request_done, 0, 0) == 0) {
+            bool success = process_dfu_request();
+            InterlockedExchange(&dfu_request_success, success ? 1 : 0);
+            InterlockedExchange(&dfu_request_done, 1);
+        }
 
         if (autoRemapActive)
         {
@@ -1895,7 +2073,7 @@ void HandleKeyInput()
             dataChanged = true;
         }
         break;
-    case '1': // 开启自动更新等待：检测到CH340即开始写入
+    case '1': // 开启自动更新等待：检测到AFF1即开始写入
         if (currentWindow == WINDOW_FIRMWARE_UPDATE && !firmware_updating)
         {
             if (!firmware_auto_mode)
@@ -4269,529 +4447,204 @@ void DisplayRawData(uint8_t *touchState, uint8_t *rawValue)
 }
 */
 
-/* ----- CH340控制函数 ----- */
-static void set_dtr(HANDLE h, bool hi)
+/* ----- DFU辅助函数 ----- */
+static bool get_affine_runtime_port(char *out, size_t cch)
 {
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    EscapeCommFunction(h, hi ? SETDTR : CLRDTR);
-}
-
-static void set_rts(HANDLE h, bool hi)
-{
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    EscapeCommFunction(h, hi ? SETRTS : CLRRTS);
-}
-
-/* ----- 进入/退出启动加载程序 ----- */
-static void enter_boot(HANDLE h)
-{
-    set_dtr(h, false); /* BOOT0 = 1 */
-    set_rts(h, true);  /* nRST = 0 */
-    Sleep(50);
-    set_rts(h, false); /* 释放复位 */
-    Sleep(100);
-}
-
-static void exit_boot(HANDLE h)
-{
-    set_dtr(h, true); /* BOOT0 = 0 */
-    set_rts(h, true); /* nRST = 0 */
-    Sleep(50);
-    set_rts(h, false); /* nRST = 1 */
-    Sleep(100);
-}
-
-/* ----- 串口通信辅助函数 ----- */
-static bool tx_byte(HANDLE h, unsigned char b)
-{
-    DWORD w = 0;
-    return WriteFile(h, &b, 1, &w, NULL) && w == 1;
-}
-
-static bool rx_byte(HANDLE h, unsigned char *b, DWORD tout_ms)
-{
-    COMMTIMEOUTS tmo;
-    GetCommTimeouts(h, &tmo);
-    COMMTIMEOUTS orig = tmo;
-    tmo.ReadIntervalTimeout = MAXDWORD;
-    tmo.ReadTotalTimeoutConstant = tout_ms;
-    tmo.ReadTotalTimeoutMultiplier = 0;
-    SetCommTimeouts(h, &tmo);
-
-    DWORD r = 0;
-    BOOL ok = ReadFile(h, b, 1, &r, NULL);
-
-    SetCommTimeouts(h, &orig);
-    return ok && r == 1;
-}
-
-/* ----- Bootloader协议函数 ----- */
-static unsigned char xor_sum(const unsigned char *p, size_t n)
-{
-    unsigned char c = 0;
-    while (n--)
-        c ^= *p++;
-    return c;
-}
-
-static bool bl_sync(HANDLE h)
-{
-    unsigned char ack;
-    for (DWORD t = 0; t < (SYNC_TIMEOUT_MS / 50); ++t)
-    {
-        if (tx_byte(h, 0x7F) && rx_byte(h, &ack, 100) && ack == 0x79)
-            return true;
-        Sleep(50);
+    if (!out || cch == 0) {
+        return false;
     }
-    return false;
-}
-
-static bool bl_cmd(HANDLE h, unsigned char cmd)
-{
-    if (!tx_byte(h, cmd) || !tx_byte(h, cmd ^ 0xFF))
-        return false;
-    unsigned char ack;
-    return rx_byte(h, &ack, 200) && ack == 0x79;
-}
-
-static bool bl_mass_erase(HANDLE h)
-{
-    if (!bl_cmd(h, 0x44))
-        return false;
-    unsigned char seq[3] = {0xFF, 0xFF, 0x00};
-    seq[2] = xor_sum(seq, 2);
-    DWORD written;
-    if (!WriteFile(h, seq, 3, &written, NULL) || written != 3)
-        return false;
-    unsigned char ack;
-    return rx_byte(h, &ack, 5000) && ack == 0x79;
-}
-
-static bool bl_write_block(HANDLE h, uint32_t addr, const unsigned char *buf, size_t len)
-{
-    if (len == 0 || len > PAGE_SZ)
-        return false;
-    if (!bl_cmd(h, 0x31))
-        return false;
-
-    unsigned char a[5] = {
-        (unsigned char)((addr >> 24) & 0xFF),
-        (unsigned char)((addr >> 16) & 0xFF),
-        (unsigned char)((addr >> 8) & 0xFF),
-        (unsigned char)(addr & 0xFF),
-        0};
-    a[4] = xor_sum(a, 4);
-    DWORD written;
-    if (!WriteFile(h, a, 5, &written, NULL) || written != 5)
-        return false;
-
-    unsigned char ack;
-    if (!rx_byte(h, &ack, 200) || ack != 0x79)
-        return false;
-
-    unsigned char pkt[PAGE_SZ + 2];
-    pkt[0] = (unsigned char)(len - 1);
-    memcpy(pkt + 1, buf, len);
-    pkt[len + 1] = xor_sum(pkt, len + 1);
-    if (!WriteFile(h, pkt, len + 2, &written, NULL) || written != len + 2)
-        return false;
-
-    return rx_byte(h, &ack, 500) && ack == 0x79;
-}
-
-static bool is_ch340(DWORD vid, DWORD pid)
-{
-    return vid == VID_CH340 && pid == PID_CH340;
-}
-
-/* ----- 查找和打开CH340设备 ----- */
-typedef struct
-{
-    char *port_result;
-    size_t result_size;
-    bool found;
-    bool multiple;
-    bool timeout;
-    volatile BOOL shouldExit;
-} CH340FindData;
-
-// 设备查找线程函数
-DWORD WINAPI FindCH340Thread(LPVOID lpParam)
-{
-    CH340FindData *findData = (CH340FindData *)lpParam;
-    findData->found = false;
-    findData->multiple = false;
-    findData->timeout = false;
-
-    HDEVINFO devs = SetupDiGetClassDevs(&GUID_DEVCLASS_PORTS, NULL, NULL, DIGCF_PRESENT);
-    if (devs == INVALID_HANDLE_VALUE)
-        return 1;
-
-    int ch340_count = 0;
-    char first_port[32] = {0};
-
-    SP_DEVINFO_DATA info = {.cbSize = sizeof(info)};
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(devs, i, &info); ++i)
-    {
-        char hwid[256] = {0};
-        DWORD n = 0;
-
-        if (ch340_count > 1)
-        {
-            findData->multiple = true;
-            SetupDiDestroyDeviceInfoList(devs);
-            return 0;
-        }
-
-        if (findData->shouldExit)
-        {
-            SetupDiDestroyDeviceInfoList(devs);
-            return 0;
-        }
-        if (!SetupDiGetDeviceRegistryPropertyA(devs, &info, SPDRP_HARDWAREID, NULL, (BYTE *)hwid, sizeof(hwid), &n))
-            continue;
-
-        // 检查是否是CH340设备
-        DWORD vid = 0, pid = 0;
-        if (sscanf(hwid, "USB\\VID_%4lx&PID_%4lx", &vid, &pid) != 2)
-            continue;
-
-        if (vid == VID_CH340 && pid == PID_CH340)
-        {
-            // 找到一个CH340设备
-            ch340_count++;
-
-            // 如果发现多个设备，立即结束搜索
-            if (ch340_count > 1)
-            {
-                findData->multiple = true;
-                SetupDiDestroyDeviceInfoList(devs);
-                return 0;
-            }
-
-            // 获取设备友好名称
-            char friendly[256] = {0};
-            if (SetupDiGetDeviceRegistryPropertyA(devs, &info, SPDRP_FRIENDLYNAME, NULL, (BYTE *)friendly, sizeof(friendly), &n))
-            {
-                // 提取COM端口号
-                char *p = strrchr(friendly, '(');
-                if (p && strstr(p, "COM"))
-                {
-                    strncpy(first_port, p + 1, sizeof(first_port) - 1);
-                    char *end = strrchr(first_port, ')');
-                    if (end)
-                        *end = 0;
-
-                    // 保存结果
-                    strncpy(findData->port_result, first_port, findData->result_size);
-                    findData->found = true;
-                }
-            }
-        }
-    }
-
-    SetupDiDestroyDeviceInfoList(devs);
-    return 0;
-}
-
-static bool find_ch340_port(char *out, size_t cch)
-{
-    // 清空输出缓冲区
     memset(out, 0, cch);
+    char *port = GetSerialPortByVidPid(Vid, Pid_1p);
+    if (!port || port[0] == 0) {
+        return false;
+    }
+    strncpy_s(out, cch, port, _TRUNCATE);
+    return true;
+}
 
-    // 准备线程参数
-    CH340FindData findData;
-    findData.shouldExit = FALSE;
-    findData.port_result = out;
-    findData.result_size = cch;
-    findData.found = false;
-    findData.multiple = false;
-    findData.timeout = false;
+static const char *trim_port_name(const char *port)
+{
+    if (!port) {
+        return "";
+    }
+    if (strncmp(port, "\\\\.\\", 4) == 0) {
+        return port + 4;
+    }
+    return port;
+}
 
-    // 创建一个独立线程执行设备枚举
-    HANDLE hThread = CreateThread(NULL, 0, FindCH340Thread, &findData, 0, NULL);
-    if (hThread == NULL)
-    {
+static bool transmit_dfu_command(HANDLE h, const char *source_label)
+{
+    if (h == NULL || h == INVALID_HANDLE_VALUE) {
+        dfu_set_last_send_info(source_label, false, 0, ERROR_INVALID_HANDLE);
         return false;
     }
 
-    const DWORD THREAD_TIMEOUT = 500;
-    DWORD waitResult = WaitForSingleObject(hThread, THREAD_TIMEOUT);
-
-    if (waitResult == WAIT_TIMEOUT)
-    {
-        findData.shouldExit = TRUE;
-        Sleep(100);
-        TerminateThread(hThread, 1);
-        CloseHandle(hThread);
-        strncpy(out, "TIMEOUT", cch);
+    const uint8_t dfu_cmd[4] = {0xFF, SERIAL_CMD_JUMP_TO_DFU, 0x00, SERIAL_CMD_JUMP_TO_DFU};
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, dfu_cmd, sizeof(dfu_cmd), &written, NULL);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    FlushFileBuffers(h);
+    if (!ok || written != sizeof(dfu_cmd)) {
+        dfu_set_last_send_info(source_label, false, written, err);
         return false;
     }
 
-    // 线程已完成
-    CloseHandle(hThread);
+    dfu_set_last_send_info(source_label, true, written, ERROR_SUCCESS);
+    return true;
+}
 
-    // 检查多设备情况
-    if (findData.multiple)
-    {
-        strncpy(out, "MULTIPLE", cch);
+static void mark_device_wait(DeviceState *state)
+{
+    if (state && *state != DEVICE_WAIT) {
+        *state = DEVICE_WAIT;
+        dataChanged = true;
+    }
+}
+
+static bool send_dfu_command_on_handle(HANDLE *handle, DeviceState *state, const char *source_label)
+{
+    if (!handle || *handle == NULL || *handle == INVALID_HANDLE_VALUE) {
         return false;
     }
 
-    // 检查是否找到设备
-    if (findData.found)
-    {
+    if (!transmit_dfu_command(*handle, source_label)) {
+        return false;
+    }
+
+    mark_device_wait(state);
+    close_port(handle);
+    return true;
+}
+
+static bool send_dfu_command_via_port_name(const char *port_name, const char *source_label)
+{
+    if (!port_name || !port_name[0]) {
+        dfu_set_last_send_info(source_label, false, 0, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    char path[32];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "\\\\.\\%s", port_name);
+
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (!open_port(&h, path)) {
+        DWORD err = GetLastError();
+        dfu_set_last_send_info(source_label, false, 0, err);
+        return false;
+    }
+
+    bool ok = transmit_dfu_command(h, source_label);
+    close_port(&h);
+    return ok;
+}
+
+static bool process_dfu_request(void)
+{
+    char label[32] = {0};
+    const char *port1_name = trim_port_name(comPort1);
+    if (port1_name && port1_name[0] != '\0') {
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "1P (%s)", port1_name);
+    } else {
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "1P");
+    }
+    if (send_dfu_command_on_handle(&hPort1, &deviceState1p, label)) {
         return true;
     }
 
-    // 没有找到设备
-    return false;
-}
+    const char *port2_name = trim_port_name(comPort2);
+    if (port2_name && port2_name[0] != '\0') {
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "2P (%s)", port2_name);
+    } else {
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "2P");
+    }
+    if (send_dfu_command_on_handle(&hPort2, &deviceState2p, label)) {
+        return true;
+    }
 
-/* ----- 打开串口进行固件更新 ----- */
-static bool open_boot_port(const char *name)
-{
-    char path[32];
-    snprintf(path, 32, "\\\\.\\%s", name);
-
-    hBootPort = CreateFile(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hBootPort == INVALID_HANDLE_VALUE)
-    {
+    char port_name[32] = {0};
+    if (!get_affine_runtime_port(port_name, sizeof(port_name))) {
+        dfu_set_last_send_info("AFF1 runtime port", false, 0, ERROR_FILE_NOT_FOUND);
         return false;
     }
 
-    SetupComm(hBootPort, 4096, 4096);
-    DCB dcb = {.DCBlength = sizeof(dcb)};
-    if (!GetCommState(hBootPort, &dcb))
-        goto err;
+    _snprintf_s(label, sizeof(label), _TRUNCATE, "AFF1 (%s)", port_name);
+    return send_dfu_command_via_port_name(port_name, label);
+}
 
-    dcb.BaudRate = BAUDRATE_BOOT;
-    dcb.Parity = EVENPARITY;
-    dcb.ByteSize = 8;
-    dcb.StopBits = ONESTOPBIT;
-    dcb.fParity = TRUE;
-    dcb.fDtrControl = DTR_CONTROL_ENABLE;
-    dcb.fRtsControl = RTS_CONTROL_DISABLE;
-    dcb.fOutxCtsFlow = dcb.fOutxDsrFlow = dcb.fOutX = dcb.fInX = FALSE;
-    if (!SetCommState(hBootPort, &dcb))
-        goto err;
+static bool send_affine_enter_dfu(void)
+{
+    dfu_reset_last_send_info();
+    InterlockedExchange(&dfu_request_success, 0);
+    InterlockedExchange(&dfu_request_done, 0);
+    InterlockedExchange(&dfu_request_flag, 1);
 
-    COMMTIMEOUTS tmo = {MAXDWORD, 100, 0, 500, 0};
-    SetCommTimeouts(hBootPort, &tmo);
-    PurgeComm(hBootPort, PURGE_TXCLEAR | PURGE_RXCLEAR);
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < 2000) {
+        if (InterlockedCompareExchange(&dfu_request_done, 0, 0) != 0) {
+            bool success = InterlockedCompareExchange(&dfu_request_success, 0, 0) != 0;
+            InterlockedExchange(&dfu_request_flag, 0);
+            return success;
+        }
+        Sleep(10);
+    }
 
-    set_dtr(hBootPort, false);
-    set_rts(hBootPort, false);
-    Sleep(100);
-    return true;
-
-err:
-    CloseHandle(hBootPort);
-    hBootPort = INVALID_HANDLE_VALUE;
+    InterlockedExchange(&dfu_request_flag, 0);
     return false;
+}
+
+static bool wait_for_affine_detach(DWORD timeout_ms)
+{
+    DWORD elapsed = 0;
+    const DWORD step = 100;
+
+    while (elapsed < timeout_ms) {
+        char port[32] = {0};
+        if (!get_affine_runtime_port(port, sizeof(port))) {
+            return true;
+        }
+        Sleep(step);
+        elapsed += step;
+    }
+
+    char port[32] = {0};
+    return !get_affine_runtime_port(port, sizeof(port));
+}
+
+static void dfu_progress_handler(int percent, void *ctx)
+{
+    (void)ctx;
+    if (percent < 0) {
+        return;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    firmware_update_progress = percent;
+    dataChanged = true;
 }
 
 /* ----- 释放固件资源 ----- */
 static void cleanup_firmware()
 {
-    if (firmware_data)
-    {
+    if (firmware_data) {
         free(firmware_data);
         firmware_data = NULL;
     }
     firmware_data_len = 0;
-    
-    if (hBootPort != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(hBootPort);
-        hBootPort = INVALID_HANDLE_VALUE;
-    }
-    
-    // 重置固件更新相关状态
     firmware_update_ready = false;
     firmware_updating = false;
     firmware_update_progress = 0;
 }
 
-/* ----- 查找并加载固件文件 ----- */
-bool FindFirmwareFile(void)
-{
-    // 获取可执行文件目录
-    wchar_t exe_path[MAX_PATH];
-    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
-
-    // 提取目录部分
-    wchar_t *last_slash = wcsrchr(exe_path, L'\\');
-    if (last_slash)
-    {
-        *(last_slash + 1) = L'\0'; // 截断文件名，只保留路径
-    }
-
-    // 构建搜索模式
-    wchar_t search_pattern[MAX_PATH];
-    wcscpy_s(search_pattern, MAX_PATH, exe_path);
-    wcscat_s(search_pattern, MAX_PATH, L"Curva_G431_*.bin");
-
-    WIN32_FIND_DATAW find_data;
-    HANDLE find_handle = FindFirstFileW(search_pattern, &find_data);
-
-    if (find_handle == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    unsigned long long latest_version = 0;
-    wchar_t latest_filename[MAX_PATH] = {0};
-
-    do
-    {
-        if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-        {
-            // 处理文件名，提取版本号
-            const wchar_t *prefix = L"Curva_G431_";
-            size_t prefix_len = wcslen(prefix);
-
-            if (wcsncmp(find_data.cFileName, prefix, prefix_len) == 0)
-            {
-                // 找到前缀，提取版本部分
-                const wchar_t *version_start = find_data.cFileName + prefix_len;
-                size_t version_len = wcslen(version_start);
-
-                // 移除可能的.bin后缀
-                if (version_len > 4 && wcscmp(version_start + version_len - 4, L".bin") == 0)
-                {
-                    version_len -= 4;
-                }
-
-                // 转换为数字进行比较
-                wchar_t version_str[32] = {0};
-                if (version_len < 32)
-                {
-                    wcsncpy_s(version_str, 32, version_start, version_len);
-                    unsigned long long version = wcstoull(version_str, NULL, 10);
-
-                    if (version > latest_version)
-                    {
-                        latest_version = version;
-                        wcscpy_s(latest_filename, MAX_PATH, find_data.cFileName);
-                    }
-                }
-            }
-        }
-    } while (FindNextFileW(find_handle, &find_data) != 0);
-
-    FindClose(find_handle);
-
-    if (latest_filename[0] == 0)
-    {
-        return false;
-    }
-
-    // 构建完整文件路径
-    wcscpy_s(firmware_path, MAX_PATH, exe_path);
-    wcscat_s(firmware_path, MAX_PATH, latest_filename);
-
-    // 提取版本号
-    wchar_t version_str[32] = {0};
-    const wchar_t *prefix = L"Curva_G431_";
-    size_t prefix_len = wcslen(prefix);
-
-    if (wcslen(latest_filename) > prefix_len)
-    {
-        wcscpy_s(version_str, 32, latest_filename + prefix_len);
-        // 移除.bin后缀
-        wchar_t *dot = wcsrchr(version_str, L'.');
-        if (dot)
-            *dot = 0;
-
-        swprintf_s(firmware_version, 32, L"v1.%s", version_str);
-    }
-
-    // 加载固件数据
-    FILE *f = NULL;
-    if (_wfopen_s(&f, firmware_path, L"rb") != 0 || !f)
-    {
-        return false;
-    }
-
-    // 获取文件大小
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (file_size <= 0)
-    {
-        fclose(f);
-        return false;
-    }
-
-    // 释放之前的固件
-    if (firmware_data)
-    {
-        free(firmware_data);
-    }
-
-    // 分配内存
-    firmware_data = (unsigned char *)malloc(file_size);
-    if (!firmware_data)
-    {
-        fclose(f);
-        return false;
-    }
-
-    firmware_data_len = (unsigned int)file_size;
-
-    // 读取文件内容
-    if (fread(firmware_data, 1, file_size, f) != (size_t)file_size)
-    {
-        fclose(f);
-        free(firmware_data);
-        firmware_data = NULL;
-        return false;
-    }
-
-    fclose(f);
-    return true;
-}
-
-// 设置更新状态消息
-void SetFirmwareStatusMessage(const char *msg)
-{
-    if (firmware_status_message)
-    {
-        free(firmware_status_message);
-    }
-
-    if (msg)
-    {
-        size_t len = strlen(msg) + 1;
-        firmware_status_message = (char *)malloc(len);
-        if (firmware_status_message)
-        {
-            strcpy_s(firmware_status_message, len, msg);
-        }
-    }
-    else
-    {
-        firmware_status_message = NULL;
-    }
-
-    dataChanged = true;
-}
-
-// 自动更新等待线程：等待检测到CH340后直接启动更新
+// 自动更新等待线程：等待检测到AFF1后直接启动更新
 DWORD WINAPI AutoUpdateWaitThread(LPVOID lpParam)
 {
-    // 持续等待CH340“插入”事件：由不存在 -> 存在 的边沿触发
     BOOL was_present = FALSE;
     while (firmware_auto_mode && currentWindow == WINDOW_FIRMWARE_UPDATE)
     {
         char port[32] = {0};
-        BOOL present = find_ch340_port(port, sizeof(port)) ? TRUE : FALSE;
+        BOOL present = get_affine_runtime_port(port, sizeof(port)) ? TRUE : FALSE;
 
-        // 边沿触发：仅在上一轮不存在，本轮出现，且当前未在更新时触发
         if (!was_present && present && !firmware_updating)
         {
             if (!firmware_update_ready || firmware_data == NULL)
@@ -4803,12 +4656,10 @@ DWORD WINAPI AutoUpdateWaitThread(LPVOID lpParam)
             {
                 StartFirmwareUpdate();
             }
-            // 若未找到固件，则继续保持等待
         }
 
         was_present = present;
 
-        // 轮询间隔
         for (int i = 0; i < 10; ++i)
         {
             if (!firmware_auto_mode || currentWindow != WINDOW_FIRMWARE_UPDATE)
@@ -4822,147 +4673,99 @@ DWORD WINAPI AutoUpdateWaitThread(LPVOID lpParam)
     return 0;
 }
 
+
 // 固件更新线程
 DWORD WINAPI UpdateFirmwareThread(LPVOID lpParam)
 {
     firmware_updating = true;
     firmware_update_progress = 0;
-    char com_port[32] = {0};
+    dataChanged = true;
 
     SetFirmwareStatusMessage("Searching for devices...");
-    Sleep(500);
+    Sleep(100);
 
-    // 寻找设备
-    if (!find_ch340_port(com_port, sizeof(com_port)))
+    char runtime_port[32] = {0};
+    if (!get_affine_runtime_port(runtime_port, sizeof(runtime_port)))
     {
-        // 检查是否是多设备错误
-        if (strcmp(com_port, "MULTIPLE") == 0)
+        SetFirmwareStatusMessage("Error: AFF1 device not found");
+        firmware_updating = false;
+        return 1;
+    }
+
+    SetFirmwareStatusMessage("Sending DFU command...");
+
+    if (!send_affine_enter_dfu())
+    {
+        if (dfu_last_send.attempted)
         {
-            SetFirmwareStatusMessage("Error: Multiple CH340 devices detected.");
-        }
-        else if (strcmp(com_port, "TIMEOUT") == 0)
-        {
-            SetFirmwareStatusMessage("Error: Device detection timed out. Please try again.");
+            char err_msg[128];
+            if (dfu_last_send.error_code != 0)
+            {
+                _snprintf_s(err_msg, sizeof(err_msg), _TRUNCATE,
+                    "Error: DFU command failed via %s (err=%lu, bytes=%lu)",
+                    dfu_last_send.source[0] ? dfu_last_send.source : "unknown",
+                    (unsigned long)dfu_last_send.error_code,
+                    (unsigned long)dfu_last_send.bytes_written);
+            }
+            else
+            {
+                _snprintf_s(err_msg, sizeof(err_msg), _TRUNCATE,
+                    "Error: DFU command failed via %s",
+                    dfu_last_send.source[0] ? dfu_last_send.source : "unknown");
+            }
+            SetFirmwareStatusMessage(err_msg);
         }
         else
         {
-            SetFirmwareStatusMessage("Error: CH340 device not found");
+            SetFirmwareStatusMessage("Error: Failed to send DFU command");
         }
         firmware_updating = false;
         return 1;
     }
 
-    SetFirmwareStatusMessage("Device connected, preparing for update...");
-    firmware_update_progress = 5;
-    Sleep(500);
+    wait_for_affine_detach(5000);
+    Sleep(300);
 
-    // 打开端口
-    if (!open_boot_port(com_port))
+    SetFirmwareStatusMessage("Connected to DFU device (waiting for transfer)");
+
+    char status_msg[256] = {0};
+    if (!dfu_loader_flash(firmware_path, dfu_progress_handler, NULL, status_msg, sizeof(status_msg)))
     {
-        SetFirmwareStatusMessage("Error: Cannot open serial port");
-        firmware_updating = false;
-        return 1;
-    }
-
-    SetFirmwareStatusMessage("Device connected, entering update mode...");
-    firmware_update_progress = 10;
-
-    // 进入bootloader模式
-    enter_boot(hBootPort);
-
-    // 同步设备
-    if (!bl_sync(hBootPort))
-    {
-        SetFirmwareStatusMessage("Error: Device synchronization failed");
-        exit_boot(hBootPort);
-        CloseHandle(hBootPort);
-        hBootPort = INVALID_HANDLE_VALUE;
-        firmware_updating = false;
-        return 1;
-    }
-
-    firmware_update_progress = 20;
-    SetFirmwareStatusMessage("Erasing chip...");
-
-    // 擦除芯片
-    bool erased = false;
-    for (int r = 0; r < ERASE_RETRY; ++r)
-    {
-        if (bl_mass_erase(hBootPort))
+        if (status_msg[0])
         {
-            erased = true;
-            break;
+            SetFirmwareStatusMessage(status_msg);
         }
-    }
-
-    if (!erased)
-    {
-        SetFirmwareStatusMessage("Error: Chip erase failed");
-        exit_boot(hBootPort);
-        CloseHandle(hBootPort);
-        hBootPort = INVALID_HANDLE_VALUE;
+        else
+        {
+            SetFirmwareStatusMessage("Error: DFU transfer failed");
+        }
         firmware_updating = false;
         return 1;
     }
-
-    firmware_update_progress = 30;
-    SetFirmwareStatusMessage("Writing firmware...");
-
-    // 写入固件
-    uint32_t addr = 0x08000000;
-    size_t sent = 0;
-
-    while (sent < firmware_data_len)
-    {
-        size_t chunk = firmware_data_len - sent;
-        if (chunk > PAGE_SZ)
-            chunk = PAGE_SZ;
-
-        if (!bl_write_block(hBootPort, addr, firmware_data + sent, chunk))
-        {
-            char err_msg[64];
-            snprintf(err_msg, sizeof(err_msg), "Error: Write failed @0x%08X", addr);
-            SetFirmwareStatusMessage(err_msg);
-            exit_boot(hBootPort);
-            CloseHandle(hBootPort);
-            hBootPort = INVALID_HANDLE_VALUE;
-            firmware_updating = false;
-            return 1;
-        }
-
-        sent += chunk;
-        addr += (uint32_t)chunk;
-
-        // 更新进度
-        firmware_update_progress = 30 + (int)(sent * 60 / firmware_data_len);
-        dataChanged = true;
-        Sleep(10);
-    }
-
-    firmware_update_progress = 95;
-    SetFirmwareStatusMessage("Verifying firmware...");
-    Sleep(500);
 
     firmware_update_progress = 100;
-    SetFirmwareStatusMessage("Update successful, restarting device");
+    dataChanged = true;
 
-    // 退出bootloader模式，重启设备
-    exit_boot(hBootPort);
-    CloseHandle(hBootPort);
-    hBootPort = INVALID_HANDLE_VALUE;
-
-    // 清理
     cleanup_firmware();
     firmware_updating = false;
-    // 如果仍处于自动模式，则继续等待下一次插入
+
+    if (status_msg[0])
+    {
+        SetFirmwareStatusMessage(status_msg);
+    }
+    else
+    {
+        SetFirmwareStatusMessage("Update successful, device restarting");
+    }
+
     if (firmware_auto_mode && currentWindow == WINDOW_FIRMWARE_UPDATE)
     {
         SetFirmwareStatusMessage("Waiting");
     }
+
     return 0;
 }
 
-// 启动固件更新过程
 void StartFirmwareUpdate(void)
 {
     if (firmware_updating)
