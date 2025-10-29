@@ -23,7 +23,7 @@
 
 /* ---------- 常量定义 ---------- */
 // 版本号
-const char *VERSION = "v0.8c";
+const char *VERSION = "v0.9";
 
 // 触摸和按键相关常量
 #define TOUCH_REGIONS 34        // 触摸区域总数
@@ -4621,6 +4621,10 @@ static void dfu_progress_handler(int percent, void *ctx)
     }
     firmware_update_progress = percent;
     dataChanged = true;
+
+    char msg[64];
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE, "Flashing firmware... %d%%", percent);
+    SetFirmwareStatusMessage(msg);
 }
 
 /* ----- 释放固件资源 ----- */
