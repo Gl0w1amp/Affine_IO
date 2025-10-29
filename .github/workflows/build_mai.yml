@@ -3,17 +3,41 @@ name: Build Affine IO-Mai
 on:
   push:
     branches: [ main, master ]
-    paths:
-      - 'mai2io/**'
+    tags:     [ '*' ]
   pull_request:
     branches: [ main, master ]
     paths:
       - 'mai2io/**'
+  release:
+    types: [ published ]
   workflow_dispatch:
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    outputs:
+      mai2io: ${{ steps.filter.outputs.mai2io }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            mai2io:
+              - 'mai2io/**'
+
   build:
     runs-on: windows-latest
+    needs: [changes]
+    if: |
+      github.event_name == 'release' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') && needs.changes.outputs.mai2io == 'true')
+
     defaults:
       run:
         shell: msys2 {0}
@@ -54,8 +78,8 @@ jobs:
           name: curva_test-exe
           path: mai2io/curva_test.exe
 
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Create Release (for tag push only)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: |
@@ -65,14 +89,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install AWS CLI
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         shell: powershell
         run: |
           choco install awscli -y
           aws --version
 
       - name: Upload DLL to Cloudflare R2 (tag subdir + latest.json)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
         shell: powershell
         working-directory: mai2io
         env:
@@ -81,7 +105,8 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          $tag  = "${env:GITHUB_REF_NAME}"
+          $tag = if ("${{ github.event_name }}" -eq "release") { "${{ github.event.release.tag_name }}" } else { "${{ github.ref_name }}" }
+
           $base = "s3://$env:R2_BUCKET/ruminasu/public/scripts/affine/mai2io"
           $dest = "$base/$tag/"
 
@@ -101,7 +126,6 @@ jobs:
           }
           $manifestJson = $manifestObj | ConvertTo-Json -Compress
           $manifestJson | Out-File -Encoding utf8 "manifest.json"
-
           aws s3 cp "manifest.json" "$dest" `
             --endpoint-url "$env:R2_ENDPOINT" `
             --cache-control "public,max-age=31536000,immutable"
